@@ -135,6 +135,34 @@ accumulating its own fall velocity while V is being teleported each tick (it cou
 damage when the carry hands back to native physics). If it does, the hand-back needs a
 velocity reset or a fall-damage suppression step.
 
+## Wall impact during a swing (C2WS-T7)
+
+`CheckWallCollisionDuringSwing()` runs every `onUpdate` tick while `IsGrappling`, before
+`UpdateGrapplePhysics` (whose collision step would otherwise slide V along the wall and erase the
+impact). It casts `ExecuteSmartRaycast` from chest height (`impact.probeHeight`) along V's flat swing
+velocity, out to `WallCheckDistance` (2 m). Hits whose normal is mostly vertical (floors, ledges;
+flat normal length below `minWallNormal2D`) are ignored, as is a swing with almost no horizontal
+speed (`minMoveSpeed2D`), since it has no travel direction to test.
+
+On a wall hit, `impactAngle = movementDir . wallNormal2D` (both flattened to z = 0):
+
+| Condition | Result |
+|---|---|
+| `abs(impactAngle) > WallLatchAngleThreshold` (0.75) | `StopGrapple()`, `TriggerWallLatch()` -> `CLIMBING` |
+| otherwise, 3D speed `>= MinimumWallRunSpeed` (8 m/s) | `StopGrapple()`, `InitiateWallRun(wallNormal2D, velocity)` -> `WALLRUNNING` |
+| otherwise (glancing but slow) | `StopGrapple()`, `TriggerWallLatch()` -> `CLIMBING` |
+
+`StopGrapple()` releases the rope with no momentum carry, so the state log always reads
+`SLINGING -> NONE -> (CLIMBING|WALLRUNNING)` within the same tick. The wall normal, impact point and
+entry velocity are left in `WebSlinger.wall` for the climb (C2WS-T8) and wall-run (C2WS-T9)
+mechanics. Each decision is printed as `[WebSlinger] wall impact #n: angle a speed s -> branch` and
+shown as "Last wall impact" in the debug panel, which also has sliders for the three tunables.
+
+Not yet verified in-game. Outstanding checks: (1) swing straight into a flat wall face -> latch;
+(2) swing past a wall at a shallow angle above 8 m/s -> wall-run; (3) the same shallow angle below
+8 m/s -> latch (fallback). Until C2WS-T8/T9 land, `CLIMBING` and `WALLRUNNING` have no movement or
+exit of their own, so after an impact use the debug panel's `NONE` button to return.
+
 ## Implementation approach (open question)
 
 CET's Lua layer can hook input, read/write exposed RTTI properties, and draw debug UI, but V's

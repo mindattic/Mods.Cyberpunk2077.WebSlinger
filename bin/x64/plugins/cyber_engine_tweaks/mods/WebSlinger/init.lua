@@ -2,7 +2,8 @@
 -- This file provides the wall-detection raycast utility (C2WS-T4) every mechanic builds on, plus
 -- its debug overlay, the traversal state machine (C2WS-T5: States + SetState with per-state
 -- onEnter/onExit hooks), and the web-sling base (C2WS-T6: hold-to-swing hotkey, cone anchor
--- search, rope-constrained pendulum physics, release with momentum carry). See docs/DESIGN.md in
+-- search, rope-constrained pendulum physics, release with momentum carry), and the wall-impact
+-- angle check during a swing (C2WS-T7: latch vs. wall-run hand-off). See docs/DESIGN.md in
 -- the repo root for the states, the raycast API notes, and the web-sling design decisions.
 
 -- Traversal states (C2WS-T5). Every mechanic reads and changes the current state only through
@@ -88,6 +89,26 @@ local WebSlinger = {
     estVel = { x = 0.0, y = 0.0, z = 0.0 },  -- smoothed velocity of V from position deltas
     lastSearch = "(none yet)",  -- one-line result of the last anchor search, for the panel
     attachCount = 0,
+  },
+
+  -- Wall-impact check during a swing (C2WS-T7) tunables.
+  impact = {
+    WallCheckDistance = 2.0,         -- metres ahead of V's velocity the impact probe reaches
+    WallLatchAngleThreshold = 0.75,  -- |movementDir . wallNormal2D| above this = head-on -> latch
+    MinimumWallRunSpeed = 8.0,       -- m/s; a diagonal hit slower than this latches instead
+    probeHeight = 1.2,               -- metres above V's feet the impact probe starts
+    minMoveSpeed2D = 1.0,            -- below this horizontal speed there is no travel direction to test
+    minWallNormal2D = 0.5,           -- hit normals flatter than this (floors, ledges) are not walls
+  },
+
+  -- Hand-off from the impact check to the climb / wall-run mechanics (C2WS-T8 / C2WS-T9).
+  -- Written by TriggerWallLatch / InitiateWallRun right before they enter their state.
+  wall = {
+    normal = nil,     -- Vector4 flat (z = 0) unit wall normal, pointing out of the wall
+    hitPos = nil,     -- Vector4 impact point
+    velocity = nil,   -- { x, y, z } V's velocity at impact
+    lastImpact = "(none yet)",  -- one-line log of the last impact decision, for the panel
+    impactCount = 0,
   },
 }
 
@@ -494,6 +515,87 @@ local function trackVelocity(player, dt)
   s.lastPos = vec4(pos.x, pos.y, pos.z)
 end
 
+-- ---------------------------------------------------------------------------------------------
+-- Wall-impact angle check during a swing (C2WS-T7)
+--
+-- Each tick while IsGrappling, a flat probe runs ahead of V's swing velocity. If it touches a
+-- wall, the angle between her horizontal travel direction and the wall's flat normal decides the
+-- follow-up: head-on latches (Mantis Blade climb), a glancing hit at speed wall-runs, and a
+-- glancing hit too slow to run falls back to latching. The rope is always released first, so the
+-- transition log reads SLINGING -> NONE -> (CLIMBING|WALLRUNNING).
+-- ---------------------------------------------------------------------------------------------
+
+--- Lets go of the rope with no momentum carry (the next mechanic owns V's movement from here).
+-- Leaves the state machine in NONE.
+function WebSlinger.StopGrapple(reason)
+  if WebSlinger.state == States.SLINGING then
+    releaseSling(reason or "StopGrapple", false)
+  end
+  WebSlinger.swing.carry = false
+end
+
+--- Hands V to the wall-climb mechanic (C2WS-T8): records the wall, enters CLIMBING.
+function WebSlinger.TriggerWallLatch(wallNormal2D, hitPos, velocity)
+  local w = WebSlinger.wall
+  w.normal, w.hitPos, w.velocity = wallNormal2D, hitPos, velocity
+  WebSlinger.SetState(States.CLIMBING)
+end
+
+--- Hands V to the wall-run mechanic (C2WS-T9): records the wall and entry velocity, enters
+-- WALLRUNNING.
+function WebSlinger.InitiateWallRun(wallNormal2D, velocity, hitPos)
+  local w = WebSlinger.wall
+  w.normal, w.hitPos, w.velocity = wallNormal2D, hitPos, velocity
+  WebSlinger.SetState(States.WALLRUNNING)
+end
+
+--- Runs the impact probe ahead of V's swing velocity. Returns true if it hit a wall and handed V
+-- to the latch or wall-run state (the caller must then skip this tick's swing physics).
+function WebSlinger.CheckWallCollisionDuringSwing()
+  if not WebSlinger.IsGrappling then return false end
+  local s, cfg = WebSlinger.swing, WebSlinger.impact
+  local v = s.vel
+  if s.pos == nil or v == nil then return false end
+
+  local speed2D = math.sqrt(v.x * v.x + v.y * v.y)
+  if speed2D < cfg.minMoveSpeed2D then return false end
+  local movementDir = Vector4.new(v.x / speed2D, v.y / speed2D, 0.0, 0.0)
+
+  local origin = vec4(s.pos.x, s.pos.y, s.pos.z + cfg.probeHeight)
+  local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(origin, movementDir, cfg.WallCheckDistance)
+  if not hit then return false end
+
+  local n2 = math.sqrt(hitNormal.x * hitNormal.x + hitNormal.y * hitNormal.y)
+  if n2 < cfg.minWallNormal2D then return false end  -- floor/ceiling-ish surface, not a wall
+  local wallNormal2D = Vector4.new(hitNormal.x / n2, hitNormal.y / n2, 0.0, 0.0)
+
+  local impactAngle = movementDir.x * wallNormal2D.x + movementDir.y * wallNormal2D.y
+  local currentSpeed = swingSpeed(v)
+  local velocity = { x = v.x, y = v.y, z = v.z }
+
+  local branch
+  if math.abs(impactAngle) > cfg.WallLatchAngleThreshold then
+    branch = "latch (head-on)"
+  elseif currentSpeed >= cfg.MinimumWallRunSpeed then
+    branch = "wall-run"
+  else
+    branch = "latch (slow fallback)"
+  end
+
+  local w = WebSlinger.wall
+  w.impactCount = w.impactCount + 1
+  w.lastImpact = string.format("angle %.2f  speed %.1f m/s -> %s", impactAngle, currentSpeed, branch)
+  print(string.format("[WebSlinger] wall impact #%d: %s", w.impactCount, w.lastImpact))
+
+  WebSlinger.StopGrapple("wall impact")
+  if branch == "wall-run" then
+    WebSlinger.InitiateWallRun(wallNormal2D, velocity, hitPos)
+  else
+    WebSlinger.TriggerWallLatch(wallNormal2D, hitPos, velocity)
+  end
+  return true
+end
+
 -- One web-sling tick: polls the swing key, fires/releases, and runs the physics. onUpdate only.
 local function updateSling(dt)
   local s, cfg = WebSlinger.swing, WebSlinger.sling
@@ -514,7 +616,8 @@ local function updateSling(dt)
       releaseSling("no anchor", false)
     elseif not held then
       releaseSling("key released", true)
-    else
+    elseif not WebSlinger.CheckWallCollisionDuringSwing() then
+      -- Impact check runs before the physics step, which would otherwise slide V along the wall.
       WebSlinger.UpdateGrapplePhysics(dt)
     end
     return
@@ -526,7 +629,9 @@ local function updateSling(dt)
       if (not wasHeld) or s.retryTimer <= 0.0 then
         s.retryTimer = cfg.retryInterval
         if tryAttach(player) then
-          WebSlinger.UpdateGrapplePhysics(dt)
+          if not WebSlinger.CheckWallCollisionDuringSwing() then
+            WebSlinger.UpdateGrapplePhysics(dt)
+          end
           return
         end
       end
@@ -746,6 +851,11 @@ registerForEvent("onDraw", function()
   end
   ImGui.Text("Last search: " .. tostring(s.lastSearch))
   ImGui.Text("Last release: " .. tostring(s.lastRelease or "(none yet)"))
+  ImGui.Text("Last wall impact: " .. tostring(WebSlinger.wall.lastImpact))
+  local ic = WebSlinger.impact
+  ic.WallCheckDistance = ImGui.SliderFloat("Wall check distance", ic.WallCheckDistance, 0.5, 6.0)
+  ic.WallLatchAngleThreshold = ImGui.SliderFloat("Latch angle threshold", ic.WallLatchAngleThreshold, 0.0, 1.0)
+  ic.MinimumWallRunSpeed = ImGui.SliderFloat("Min wall-run speed", ic.MinimumWallRunSpeed, 0.0, 25.0)
   cfg.AnchorMaxDistance = ImGui.SliderFloat("Anchor max distance", cfg.AnchorMaxDistance, 10.0, 100.0)
   cfg.reelSpeed = ImGui.SliderFloat("Reel speed", cfg.reelSpeed, 0.0, 15.0)
   cfg.gravity = ImGui.SliderFloat("Swing gravity", cfg.gravity, 5.0, 30.0)
