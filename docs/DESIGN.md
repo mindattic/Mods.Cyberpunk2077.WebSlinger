@@ -263,6 +263,50 @@ Both appear unaltered in `PeterText.body` in `init.lua`; the overlay shows a one
 the bubble. Not yet verified in-game: open the overlay and confirm the whole message is readable
 without clipping at 1080p and 4K, the header reads 'Peter Parker', and both quotes appear as above.
 
+## Wall-run (C2WS-T9)
+
+Two entry points into `WALLRUNNING`, neither gated by any equipment or cyberware check:
+
+1. **Automatic:** a glancing swing impact at speed (C2WS-T7) calls
+   `InitiateWallRun(wallNormal2D, velocity, hitPos)`.
+2. **Manual (Titanfall-style):** pressing the game's own Jump action while in `NONE` (on foot, falling,
+   or in post-swing carry) runs `TryManualWallRun()`. It casts `ExecuteSmartRaycast` from chest
+   height to V's left and right and along both forward diagonals (relative to her look/move
+   heading), out to `ManualTriggerDistance` (1.5 m), and takes the nearest wall whose normal is not
+   facing her head-on (`abs(heading . normal) <= ManualMaxFacingDot`, 0.8), so a wall straight
+   ahead stays the climb's business. Jump is read through `Observe("PlayerPuppet", "OnAction")`, so
+   it is whatever the player has bound to jump.
+
+`InitiateWallRun` follows the ticket's reference: `wallParallelDir` is the perpendicular of the
+flat wall normal with the sign matching V's travel (her look heading if she is barely moving along
+the wall), `wallRunSpeed = max(|velocity|, MinWallRunSpeed)` (15 m/s) for the manual trigger only;
+a swing-impact entry keeps V's actual speed (already at least `impact.MinimumWallRunSpeed`, 8 m/s),
+so the hand-off never injects velocity and momentum is conserved. The run velocity is
+`wallParallelDir * wallRunSpeed + wallNormal * -StickyForce` (1.5) with Z pinned to `AntiGravityZ`
+(+2.5). `UpdateWallHangPhysics(dt)` runs every `onUpdate` tick while `WALLRUNNING`: it re-probes the
+wall along `-normal` (`WallProbeDistance`, 1.6 m), refreshes the normal and run direction (so gentle
+curves are followed), and re-applies the velocity. The run ends (state -> `NONE`) when the probe
+misses (end of the wall), a wall blocks the way ahead, or `MaxWallRunTime` (4 s) passes.
+
+Velocity is written with `player:GetLocomotionComponent():SetLinearVelocity(...)` as the ticket
+specifies. That call is not confirmed to exist in CET's RTTI, so it is `pcall`-guarded: if it errors
+(or the debug panel's "Wall-run via SetLinearVelocity" box is cleared), the run switches to the
+same teleport-per-tick approach the web-sling uses, integrating the position and holding V
+`WallStandoff` (0.45 m) off the wall plane; on a natural end it hands the run velocity to the
+web-sling momentum carry. Camera tilt: `Game.GetCameraSystem():SetCameraTilt(CameraTiltDeg * side,
+CameraTiltTime)` (10 degrees, 0.3 s) on entry, signed by which side the wall is on, and
+`SetCameraTilt(0, CameraTiltTime)` on exit; also `pcall`-guarded since the API is unverified, and the
+sign convention needs checking in-game.
+
+Jump while already wall-running is ignored here; the wall jump is C2WS-T10. All tunables live in
+`WebSlinger.wallrun` and the main ones have debug-panel sliders.
+
+Not yet verified in-game (the implementing agent could not run the game). Outstanding checks:
+(1) wall-run along a straight building face for at least 3 s, entered from a swing impact, without
+sliding off or clipping in; (2) approach a wall on foot and mid-air, look/move toward it to one
+side, press jump, and confirm the same run starts; (3) whether `SetLinearVelocity` and
+`SetCameraTilt` exist (watch the CET console for the "driving V by teleport" line).
+
 ## Implementation approach (open question)
 
 CET's Lua layer can hook input, read/write exposed RTTI properties, and draw debug UI, but V's

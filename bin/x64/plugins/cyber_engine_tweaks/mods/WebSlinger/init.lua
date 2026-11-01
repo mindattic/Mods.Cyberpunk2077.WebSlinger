@@ -3,8 +3,9 @@
 -- its debug overlay, the traversal state machine (C2WS-T5: States + SetState with per-state
 -- onEnter/onExit hooks), and the web-sling base (C2WS-T6: hold-to-swing hotkey, cone anchor
 -- search, rope-constrained pendulum physics, release with momentum carry), and the wall-impact
--- angle check during a swing (C2WS-T7: latch vs. wall-run hand-off). See docs/DESIGN.md in
--- the repo root for the states, the raycast API notes, and the web-sling design decisions.
+-- angle check during a swing (C2WS-T7: latch vs. wall-run hand-off), and the wall-run itself
+-- (C2WS-T9: wall-parallel run velocity, sticky force, camera tilt, manual jump-key trigger). See
+-- docs/DESIGN.md in the repo root for the states, the raycast API notes, and the design decisions.
 
 -- Traversal states (C2WS-T5). Every mechanic reads and changes the current state only through
 -- WebSlinger.state and WebSlinger.SetState; never assign WebSlinger.state directly.
@@ -143,6 +144,42 @@ local WebSlinger = {
 
 -- Collision groups the probe tests against. Walls are static geometry; terrain covers rock faces.
 local WALL_COLLISION_GROUPS = { "Static", "Terrain" }
+
+-- Wall-run (C2WS-T9) tunables. Speeds in m/s, times in seconds, distances in metres.
+WebSlinger.wallrun = {
+  MinWallRunSpeed = 15.0,       -- speed floor for a manual (jump) wall-run; swing entries keep their speed
+  StickyForce = 1.5,            -- velocity pushed into the wall every tick so V can't drift off it
+  AntiGravityZ = 2.5,           -- vertical velocity pinned for the whole run (no sag, slight rise)
+  CameraTiltDeg = 10.0,         -- camera roll on entry, away from the wall
+  CameraTiltTime = 0.3,         -- blend time of the tilt in and back to neutral
+  MaxWallRunTime = 4.0,         -- hard cap on one run before V drops off
+  WallProbeDistance = 1.6,      -- per-tick "still on the wall" probe reach, into the wall
+  WallStandoff = 0.45,          -- teleport fallback keeps V's centre this far off the wall plane
+  BlockedProbeDistance = 1.0,   -- an obstacle this close ahead along the run ends it
+  probeHeight = 1.2,            -- metres above V's feet the wall probes start
+  minWallNormal2D = 0.5,        -- hit normals flatter than this (floors, ledges) are not walls
+  ManualTriggerDistance = 1.5,  -- jump-key side probes reach this far left/right of V
+  ManualMaxFacingDot = 0.8,     -- |aim heading . wallNormal| above this = wall ahead, not to the side
+  UseLocomotionVelocity = true, -- false = drive V by teleport each tick instead of SetLinearVelocity
+}
+
+-- Live wall-run state. Written by InitiateWallRun, UpdateWallHangPhysics and the WALLRUNNING hooks.
+WebSlinger.run = {
+  normal = nil,         -- Vector4 flat unit wall normal (out of the wall), refreshed every tick
+  dir = nil,            -- Vector4 flat unit run direction along the wall
+  speed = 0.0,          -- run speed along the wall, fixed at entry
+  side = 0,             -- +1 wall on V's right, -1 on her left
+  time = 0.0,
+  pos = nil,            -- simulated feet position, teleport fallback only
+  vel = nil,            -- last velocity applied { x, y, z }
+  teleportMode = false, -- true when SetLinearVelocity is off or failed this run
+  endReason = nil,      -- set by endWallRun right before leaving WALLRUNNING
+  endCarry = nil,
+  jumpQueued = false,   -- jump pressed since the last onUpdate tick
+  lastEntry = "(none yet)",
+  lastEnd = "(none yet)",
+  count = 0,
+}
 
 local function vec4(x, y, z)
   return Vector4.new(x, y, z, 1.0)
@@ -572,12 +609,278 @@ function WebSlinger.TriggerWallLatch(wallNormal2D, hitPos, velocity)
   WebSlinger.SetState(States.CLIMBING)
 end
 
---- Hands V to the wall-run mechanic (C2WS-T9): records the wall and entry velocity, enters
--- WALLRUNNING.
-function WebSlinger.InitiateWallRun(wallNormal2D, velocity, hitPos)
-  local w = WebSlinger.wall
-  w.normal, w.hitPos, w.velocity = wallNormal2D, hitPos, velocity
+-- ---------------------------------------------------------------------------------------------
+-- Wall-run (C2WS-T9)
+--
+-- Entered two ways, neither gated on any equipment: automatically from a glancing swing impact
+-- (CheckWallCollisionDuringSwing below), or manually by pressing jump with a wall close to V's
+-- left or right (TryManualWallRun). While WALLRUNNING, UpdateWallHangPhysics re-applies the run
+-- velocity every tick: along the wall at a fixed speed, a small sticky push into the wall, and Z
+-- pinned to AntiGravityZ. See docs/DESIGN.md.
+-- ---------------------------------------------------------------------------------------------
+
+-- Flattens v to z = 0 and normalizes it; nil if it has (almost) no horizontal extent.
+local function flatUnit(v)
+  local len = math.sqrt(v.x * v.x + v.y * v.y)
+  if len < 1e-4 then return nil end
+  return Vector4.new(v.x / len, v.y / len, 0.0, 0.0)
+end
+
+-- Writes V's velocity through her locomotion component. Returns false if the call is unavailable
+-- or errors, so the caller can fall back to driving her position by teleport.
+local function setLinearVelocity(player, v)
+  local ok = pcall(function()
+    player:GetLocomotionComponent():SetLinearVelocity(Vector4.new(v.x, v.y, v.z, 0.0))
+  end)
+  return ok
+end
+
+local function setCameraTilt(degrees, blendTime)
+  pcall(function()
+    Game.GetCameraSystem():SetCameraTilt(degrees, blendTime)
+  end)
+end
+
+-- Probes from V's chest into the wall (along -normal). Returns the flat wall normal and hit point,
+-- or nil if the wall is gone or what was hit is not a wall.
+local function probeRunWall(pos, normal, distance)
+  local cfg = WebSlinger.wallrun
+  local origin = vec4(pos.x, pos.y, pos.z + cfg.probeHeight)
+  local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(origin,
+    Vector4.new(-normal.x, -normal.y, 0.0, 0.0), distance)
+  if not hit then return nil end
+  local n2 = math.sqrt(hitNormal.x * hitNormal.x + hitNormal.y * hitNormal.y)
+  if n2 < cfg.minWallNormal2D then return nil end
+  return Vector4.new(hitNormal.x / n2, hitNormal.y / n2, 0.0, 0.0), hitPos
+end
+
+-- The run velocity for the current wall: wallParallelDir * speed + wallNormal * -StickyForce,
+-- with Z pinned to AntiGravityZ.
+local function runVelocity(r, cfg)
+  return {
+    x = r.dir.x * r.speed - r.normal.x * cfg.StickyForce,
+    y = r.dir.y * r.speed - r.normal.y * cfg.StickyForce,
+    z = cfg.AntiGravityZ,
+  }
+end
+
+-- Applies velocity v to V for this tick. Uses SetLinearVelocity when enabled and available;
+-- otherwise integrates r.pos and teleports, holding V WallStandoff off the wall plane (the
+-- teleport path's stand-in for the sticky force).
+local function applyRunVelocity(player, r, v, dt, hitPos)
+  local cfg = WebSlinger.wallrun
+  r.vel = v
+  if not r.teleportMode then
+    if cfg.UseLocomotionVelocity and setLinearVelocity(player, v) then return end
+    r.teleportMode = true
+    local p = player:GetWorldPosition()
+    r.pos = vec4(p.x, p.y, p.z)
+    print("[WebSlinger] wall-run: SetLinearVelocity unavailable or off, driving V by teleport")
+  end
+  local p = r.pos
+  local nx, ny, nz = p.x + v.x * dt, p.y + v.y * dt, p.z + v.z * dt
+  if hitPos ~= nil then
+    local d = (nx - hitPos.x) * r.normal.x + (ny - hitPos.y) * r.normal.y
+    nx = nx + r.normal.x * (cfg.WallStandoff - d)
+    ny = ny + r.normal.y * (cfg.WallStandoff - d)
+  end
+  r.pos = vec4(nx, ny, nz)
+  placeV(player, r.pos)
+  WebSlinger.swing.lastPos = vec4(nx, ny, nz)
+end
+
+--- Ends the wall-run (state -> NONE). carry = true hands V's run velocity to the web-sling
+-- momentum carry when the run was teleport-driven (with SetLinearVelocity the engine keeps it).
+local function endWallRun(reason, carry)
+  local r = WebSlinger.run
+  r.endReason, r.endCarry = reason, carry
+  WebSlinger.SetState(States.NONE)
+end
+WebSlinger.EndWallRun = endWallRun
+
+--- Hands V to the wall-run: computes the wall-parallel direction (the perpendicular of the wall
+-- normal whose sign matches V's travel), the run speed max(|currentVelocity|, MinWallRunSpeed),
+-- enters WALLRUNNING and applies the first tick of run velocity. The MinWallRunSpeed floor
+-- applies only when manual is true (jump trigger); a swing-impact entry keeps its actual speed. Accepts either a Vector4 or a
+-- { x, y, z } table for currentVelocity. No equipment check gates entry. Returns true if the run
+-- started.
+function WebSlinger.InitiateWallRun(wallNormal, currentVelocity, hitPos, manual)
+  local w, r, cfg = WebSlinger.wall, WebSlinger.run, WebSlinger.wallrun
+  local n = flatUnit(wallNormal)
+  if n == nil then return false end
+  local vel = currentVelocity or { x = 0.0, y = 0.0, z = 0.0 }
+  w.normal, w.hitPos, w.velocity = n, hitPos, { x = vel.x, y = vel.y, z = vel.z }
+
+  local player = Game.GetPlayer()
+  local wallParallelDir = Vector4.new(-n.y, n.x, 0.0, 0.0)
+  local along = vel.x * wallParallelDir.x + vel.y * wallParallelDir.y
+  if math.abs(along) < 1.0 and player ~= nil then
+    -- Barely moving along the wall (e.g. a standing manual trigger): run where V is looking.
+    local hx, hy = aimHeading(player, false)
+    along = hx * wallParallelDir.x + hy * wallParallelDir.y
+  end
+  if along < 0 then
+    wallParallelDir = Vector4.new(n.y, -n.x, 0.0, 0.0)
+  end
+
+  r.normal, r.dir = n, wallParallelDir
+  local entrySpeed = math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z)
+  if manual then
+    -- Manual trigger: no swing speed to preserve, so give the run its minimum speed.
+    r.speed = math.max(entrySpeed, cfg.MinWallRunSpeed)
+  else
+    -- Swing impact: keep V's actual speed (momentum conservation). C2WS-T7 already requires
+    -- impact.MinimumWallRunSpeed to route here, so no boost up to MinWallRunSpeed.
+    r.speed = entrySpeed
+  end
+  -- The wall lies along -n from V; her right-hand side when facing the run direction is (dir.y, -dir.x).
+  r.side = (-n.x * wallParallelDir.y + n.y * wallParallelDir.x) > 0 and 1 or -1
+  r.time = 0.0
+  r.teleportMode = not cfg.UseLocomotionVelocity
+  if player ~= nil then
+    local p = player:GetWorldPosition()
+    r.pos = vec4(p.x, p.y, p.z)
+  end
+  r.count = r.count + 1
+  r.lastEntry = string.format("#%d  speed %.1f m/s  wall on %s", r.count, r.speed, r.side > 0 and "right" or "left")
+  print("[WebSlinger] wall-run " .. r.lastEntry)
+
   WebSlinger.SetState(States.WALLRUNNING)
+  if player ~= nil and WebSlinger.state == States.WALLRUNNING then
+    applyRunVelocity(player, r, runVelocity(r, cfg), 0.0, hitPos)
+  end
+  return true
+end
+
+--- One wall-run tick (onUpdate, while WALLRUNNING): re-probes the wall, follows its normal round
+-- gentle curves, and re-applies the run velocity so V can't slip off mid-run. Ends the run when
+-- the wall runs out, something blocks the way ahead, or MaxWallRunTime passes.
+function WebSlinger.UpdateWallHangPhysics(deltaTime)
+  local r, cfg = WebSlinger.run, WebSlinger.wallrun
+  local player = Game.GetPlayer()
+  if player == nil or r.normal == nil or r.dir == nil then
+    endWallRun(player == nil and "no player" or "no wall (entered without InitiateWallRun)", false)
+    return
+  end
+
+  r.time = r.time + deltaTime
+  if r.time >= cfg.MaxWallRunTime then
+    endWallRun("time cap", true)
+    return
+  end
+
+  local pos = r.teleportMode and r.pos or player:GetWorldPosition()
+  local newNormal, hitPos = probeRunWall(pos, r.normal, cfg.WallProbeDistance)
+  if newNormal == nil then
+    endWallRun("ran off the wall", true)
+    return
+  end
+  r.normal = newNormal
+  local dir = Vector4.new(-newNormal.y, newNormal.x, 0.0, 0.0)
+  if dir.x * r.dir.x + dir.y * r.dir.y < 0 then dir = Vector4.new(newNormal.y, -newNormal.x, 0.0, 0.0) end
+  r.dir = dir
+
+  local origin = vec4(pos.x, pos.y, pos.z + cfg.probeHeight)
+  local blocked, _, blockNormal = WebSlinger.ExecuteSmartRaycast(origin, dir, cfg.BlockedProbeDistance)
+  if blocked and (blockNormal.x * dir.x + blockNormal.y * dir.y) < -0.5 then
+    endWallRun("blocked ahead", false)
+    return
+  end
+
+  applyRunVelocity(player, r, runVelocity(r, cfg), deltaTime, hitPos)
+end
+
+--- Manual, Titanfall-style entry: called when jump is pressed. If V is not already in a traversal
+-- state and a wall lies within ManualTriggerDistance to her left or right (side and forward-
+-- diagonal probes; a wall straight ahead does not count), starts a wall-run on the nearest one.
+-- Returns true if a run started.
+function WebSlinger.TryManualWallRun()
+  if WebSlinger.state ~= States.NONE then return false end
+  local player = Game.GetPlayer()
+  if player == nil then return false end
+  local cfg, s = WebSlinger.wallrun, WebSlinger.swing
+
+  local pos = player:GetWorldPosition()
+  local origin = vec4(pos.x, pos.y, pos.z + cfg.probeHeight)
+  local hx, hy = aimHeading(player, true)
+  local rx, ry = hy, -hx  -- V's right
+  local probes = {
+    Vector4.new(rx, ry, 0.0, 0.0),
+    Vector4.new(-rx, -ry, 0.0, 0.0),
+    Vector4.new(rx + hx, ry + hy, 0.0, 0.0),
+    Vector4.new(-rx + hx, -ry + hy, 0.0, 0.0),
+  }
+
+  local bestNormal, bestPos, bestDist = nil, nil, math.huge
+  for _, dir in ipairs(probes) do
+    local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(origin, dir, cfg.ManualTriggerDistance)
+    if hit then
+      local n = flatUnit(hitNormal)
+      local n2 = math.sqrt(hitNormal.x * hitNormal.x + hitNormal.y * hitNormal.y)
+      if n ~= nil and n2 >= cfg.minWallNormal2D and math.abs(n.x * hx + n.y * hy) <= cfg.ManualMaxFacingDot then
+        local dx, dy = hitPos.x - origin.x, hitPos.y - origin.y
+        local dist = dx * dx + dy * dy
+        if dist < bestDist then bestNormal, bestPos, bestDist = n, hitPos, dist end
+      end
+    end
+  end
+  if bestNormal == nil then return false end
+
+  local seed = s.carry and s.vel or s.estVel
+  local velocity = { x = seed.x, y = seed.y, z = seed.z }
+  s.carry = false
+  print("[WebSlinger] wall-run: manual trigger (jump)")
+  return WebSlinger.InitiateWallRun(bestNormal, velocity, bestPos, true)
+end
+
+-- Camera tilt plays on entry (rolled away from the wall) and blends back to neutral on exit.
+StateHooks[States.WALLRUNNING].onEnter = function()
+  local r, cfg = WebSlinger.run, WebSlinger.wallrun
+  r.endReason, r.endCarry = nil, nil
+  if r.normal ~= nil then
+    setCameraTilt(cfg.CameraTiltDeg * r.side, cfg.CameraTiltTime)
+  end
+end
+
+StateHooks[States.WALLRUNNING].onExit = function()
+  local r, s = WebSlinger.run, WebSlinger.swing
+  setCameraTilt(0.0, WebSlinger.wallrun.CameraTiltTime)
+  local reason = r.endReason or "left WALLRUNNING via SetState"
+  if r.endCarry and r.teleportMode and r.pos ~= nil and r.vel ~= nil then
+    -- Teleport-driven run: keep its speed going through the web-sling momentum carry.
+    s.pos = vec4(r.pos.x, r.pos.y, r.pos.z)
+    s.vel = { x = r.vel.x, y = r.vel.y, z = r.vel.z }
+    s.carry, s.carryTime = true, 0.0
+  end
+  r.lastEnd = string.format("%s after %.2f s", reason, r.time)
+  print("[WebSlinger] wall-run ended: " .. r.lastEnd)
+  r.normal, r.dir, r.pos, r.endReason, r.endCarry = nil, nil, nil, nil, nil
+end
+
+-- The manual trigger listens to the game's own Jump action, so it uses whatever the player has
+-- bound to jump. Registered in onInit; only queues, the onUpdate tick does the work.
+local function observeWallRunJump()
+  Observe("PlayerPuppet", "OnAction", function(_, action)
+    if WebSlinger.state ~= States.NONE then return end
+    local ok, isJump = pcall(function()
+      return Game.NameToString(ListenerAction.GetName(action)) == "Jump"
+        and ListenerAction.GetType(action).value == "BUTTON_PRESSED"
+    end)
+    if ok and isJump then WebSlinger.run.jumpQueued = true end
+  end)
+end
+
+-- One wall-run tick: consumes a queued jump press (manual trigger) and runs the wall-run physics.
+-- onUpdate only.
+local function updateWallRun(dt)
+  local r = WebSlinger.run
+  local jump = r.jumpQueued
+  r.jumpQueued = false
+  if WebSlinger.state == States.WALLRUNNING then
+    WebSlinger.UpdateWallHangPhysics(dt)
+  elseif jump and WebSlinger.state == States.NONE then
+    WebSlinger.TryManualWallRun()
+  end
 end
 
 --- Runs the impact probe ahead of V's swing velocity. Returns true if it hit a wall and handed V
@@ -1112,6 +1415,7 @@ end
 registerForEvent("onInit", function()
   print("[WebSlinger] loaded (wall raycast utility, state machine, web-sling base)")
   observeClimbInput()
+  observeWallRunJump()
 end)
 
 registerForEvent("onUpdate", function(deltaTime)
@@ -1126,6 +1430,8 @@ registerForEvent("onUpdate", function(deltaTime)
   if not WebSlinger.enabled then
     if WebSlinger.state == States.SLINGING then releaseSling("mod disabled", false) end
     if WebSlinger.state == States.CLIMBING then exitClimb("mod disabled", nil) end
+    if WebSlinger.state == States.WALLRUNNING then WebSlinger.EndWallRun("mod disabled", false) end
+    WebSlinger.run.jumpQueued = false
     WebSlinger.swing.carry = false
     WebSlinger.swing.lastPos = nil
     return
@@ -1135,7 +1441,8 @@ registerForEvent("onUpdate", function(deltaTime)
   local dt = math.min(deltaTime, 0.05)
   updateSling(dt)
   WebSlinger.UpdateClimb(dt)
-  -- TODO: wall-run / wall-jump mechanics go here.
+  updateWallRun(dt)
+  -- TODO: wall-jump mechanics go here.
 end)
 
 registerForEvent("onDraw", function()
@@ -1217,6 +1524,23 @@ registerForEvent("onDraw", function()
   cfg.reelSpeed = ImGui.SliderFloat("Reel speed", cfg.reelSpeed, 0.0, 15.0)
   cfg.gravity = ImGui.SliderFloat("Swing gravity", cfg.gravity, 5.0, 30.0)
   cfg.steerAccel = ImGui.SliderFloat("Steer accel", cfg.steerAccel, 0.0, 20.0)
+
+  ImGui.Separator()
+  local r, wr = WebSlinger.run, WebSlinger.wallrun
+  ImGui.Text("Wall-run: press jump with a wall to your left/right, or glance off one mid-swing")
+  if WebSlinger.state == States.WALLRUNNING and r.vel ~= nil then
+    ImGui.Text(string.format("Running: %.2f s   Speed %.1f m/s   Mode: %s", r.time, r.speed,
+      r.teleportMode and "teleport" or "SetLinearVelocity"))
+  end
+  ImGui.Text("Last wall-run: " .. tostring(r.lastEntry))
+  ImGui.Text("Last wall-run end: " .. tostring(r.lastEnd))
+  wr.UseLocomotionVelocity = ImGui.Checkbox("Wall-run via SetLinearVelocity", wr.UseLocomotionVelocity)
+  wr.MinWallRunSpeed = ImGui.SliderFloat("Wall-run min speed", wr.MinWallRunSpeed, 5.0, 30.0)
+  wr.StickyForce = ImGui.SliderFloat("Wall-run sticky force", wr.StickyForce, 0.0, 5.0)
+  wr.AntiGravityZ = ImGui.SliderFloat("Wall-run anti-gravity Z", wr.AntiGravityZ, -2.0, 6.0)
+  wr.CameraTiltDeg = ImGui.SliderFloat("Wall-run camera tilt", wr.CameraTiltDeg, 0.0, 25.0)
+  wr.MaxWallRunTime = ImGui.SliderFloat("Wall-run max time", wr.MaxWallRunTime, 1.0, 10.0)
+  wr.ManualTriggerDistance = ImGui.SliderFloat("Wall-run jump reach", wr.ManualTriggerDistance, 0.5, 4.0)
 
   ImGui.Separator()
   if ImGui.Button("Send Peter Parker intro text") then
