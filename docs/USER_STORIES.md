@@ -23,4 +23,4 @@ _Nothing recorded yet._
 |---|---|---|---|---|---|
 | C2WS-T1 | 2026-11-01 | docs | closed | Start the permanent ticket log in the ticket database | — |
 | C2WS-T2 | 2026-11-01 | feature | closed | Scaffold new repo: Cyberpunk 2077 mod for Mantis Blade wall-climb, wall-run/jump, and Spider-Man 2 style webslinging | 7aad643ac7c88e810331b43e6e85a40b41323aaf |
-| C2WS-T3 | 2026-11-01 | chore | open | Rename repo to Mods.Cyberpunk2077.WebSlinger for mod organization (GitHub + folder + refs) | — |
+| C2WS-T3 | 2026-11-01 | chore | closed | Rename repo to Mods.Cyberpunk2077.WebSlinger for mod organization (GitHub + folder + refs) | 36d0a7610a8d43186a58b5ea925f2190e04bf613 |
