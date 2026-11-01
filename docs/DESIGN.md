@@ -355,6 +355,38 @@ times without touching the ground ("chain xN" in the CET console / panel), each 
 comparable height and distance to the first. Also confirm jumping off a wall-run launches out and
 forward, not back into the wall.
 
+## Re-sling loop (C2WS-T12)
+
+The web-sling input fires whenever V is in `NONE`, however `NONE` was entered (wall-jump, wall-run
+drop-off, climb exit, swing release, or a plain fall): `updateSling` only looks at the current state,
+and every mechanic leaves through `SetState(NONE)`, so swing -> wall-run -> wall-jump -> swing ->
+latch -> climb-jump -> swing needs no special-casing. With the key held through a wall state the
+re-attach comes within `retryInterval` (0.15 s) of reaching `NONE`; a fresh press attaches at once.
+
+The end-to-end pass found and fixed three leaks between the mechanics:
+
+1. **Stale velocity estimate after a swing.** `trackVelocity` does not run while `SLINGING`, so a
+   release without carry (landed, wall impact) left the pre-swing `swing.estVel` behind; it then
+   seeded the next swing and the wall-run's measured-speed drop-off. `UpdateGrapplePhysics` now keeps
+   `estVel` equal to the swing velocity every tick.
+2. **Teleport-mode wall-run always "too slow".** The teleport fallback of `applyRunVelocity` set
+   `swing.lastPos` to the new position, so the next tick's `trackVelocity` measured ~0 m/s and the
+   run ended right after `SpeedCheckGrace`. The write is gone; `trackVelocity` measures the real
+   per-tick displacement.
+3. **Wall-jump flight surviving a re-sling.** A swing that attached and released with carry inside
+   one tick left `wj.flying` set, so the post-swing carry was treated as the old wall-jump's flight
+   (wall catch and chain check against the stale launch wall). `SLINGING`'s `onEnter` now clears it.
+
+**Verification aid.** `SetState` keeps the last 16 transitions in `WebSlinger.transitionLog` (shown
+under "Transition log" in the debug panel, with a Clear button) and counts any `SLINGING` entry
+whose previous state was not `NONE` (`slingWithoutNone`, also printed as a WARNING line). It must
+stay 0; only the debug Force state buttons can raise it on purpose.
+
+Not yet verified in-game (the implementing agent could not run the game). Outstanding check from
+the ticket, in one continuous take: swing -> wall-run -> wall-jump -> swing again ->
+wall-latch-climb -> climb-jump -> swing again, with no scripting error, no stuck state, and the
+transition log showing a `NONE` between every two `SLINGING` entries (counter still 0).
+
 ## Implementation approach (open question)
 
 CET's Lua layer can hook input, read/write exposed RTTI properties, and draw debug UI, but V's

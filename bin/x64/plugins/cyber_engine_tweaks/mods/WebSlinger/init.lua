@@ -5,7 +5,8 @@
 -- search, rope-constrained pendulum physics, release with momentum carry), and the wall-impact
 -- angle check during a swing (C2WS-T7: latch vs. wall-run hand-off), and the wall-run itself
 -- (C2WS-T9: wall-parallel run velocity, sticky force, camera tilt, manual jump-key trigger), and the
--- wall-jump off a climb or wall-run, chainable between facing walls (C2WS-T11). See
+-- wall-jump off a climb or wall-run, chainable between facing walls (C2WS-T11), and the
+-- end-to-end re-sling loop pass (C2WS-T12: state-leak fixes plus a transition log). See
 -- docs/DESIGN.md in the repo root for the states, the raycast API notes, and the design decisions.
 
 -- Traversal states (C2WS-T5). Every mechanic reads and changes the current state only through
@@ -20,6 +21,9 @@ local States = {
 -- Display/iteration order for the debug panel.
 local STATE_ORDER = { States.NONE, States.CLIMBING, States.WALLRUNNING, States.SLINGING }
 
+-- How many recent transitions the debug panel's transition log keeps (C2WS-T12).
+local TRANSITION_LOG_SIZE = 16
+
 local WebSlinger = {
   -- C2WS-T16: release version; tools/package.ps1 names dist/WebSlinger-<version>.zip from it.
   version = "0.1.0",
@@ -28,6 +32,8 @@ local WebSlinger = {
   state = States.NONE,
   lastTransition = nil, -- { from, to, clock, wallTime } of the most recent SetState, nil if none yet
   transitionCount = 0,
+  transitionLog = {},    -- last TRANSITION_LOG_SIZE transitions, oldest first, for the debug panel (C2WS-T12)
+  slingWithoutNone = 0,  -- SLINGING entries not coming from NONE; must stay 0 (C2WS-T12)
 
   debugRaycast = false,  -- "Debug: show wall raycast" checkbox
   probeDistance = 3.0,   -- metres the forward wall probe reaches
@@ -316,6 +322,18 @@ function WebSlinger.SetState(newState)
   }
   print(string.format("[WebSlinger] state %s -> %s (#%d)", oldState, newState, WebSlinger.transitionCount))
 
+  -- Re-sling loop check (C2WS-T12): every swing must start from NONE, so a SLINGING entry from
+  -- any other state is state leakage (only the debug Force state buttons can do it on purpose).
+  local log = WebSlinger.transitionLog
+  log[#log + 1] = string.format("#%d %s %s -> %s", WebSlinger.transitionCount,
+    WebSlinger.lastTransition.wallTime, oldState, newState)
+  if #log > TRANSITION_LOG_SIZE then table.remove(log, 1) end
+  if newState == States.SLINGING and oldState ~= States.NONE then
+    WebSlinger.slingWithoutNone = WebSlinger.slingWithoutNone + 1
+    print(string.format("[WebSlinger] WARNING: SLINGING entered from %s, not NONE (#%d)",
+      oldState, WebSlinger.slingWithoutNone))
+  end
+
   local exitHook = StateHooks[oldState] and StateHooks[oldState].onExit
   if exitHook then exitHook(oldState) end
   local enterHook = StateHooks[newState].onEnter
@@ -528,6 +546,10 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
   local landed = moveWithCollision(s, nx, ny, nz)
   placeV(player, s.pos)
   s.lastPos = vec4(s.pos.x, s.pos.y, s.pos.z)
+  -- Keep the velocity estimate current through the swing (C2WS-T12): trackVelocity does not run
+  -- while SLINGING, so without this a no-carry release (landed, wall impact) left the pre-swing
+  -- estimate behind to seed the next swing, or a wall-run's measured-speed drop-off check.
+  s.estVel = { x = v.x, y = v.y, z = v.z }
 
   if landed then
     releaseSling("landed", false)
@@ -721,7 +743,9 @@ local function applyRunVelocity(player, r, v, dt, hitPos)
   end
   r.pos = vec4(nx, ny, nz)
   placeV(player, r.pos)
-  WebSlinger.swing.lastPos = vec4(nx, ny, nz)
+  -- Deliberately no swing.lastPos write here (C2WS-T12): trackVelocity runs every WALLRUNNING tick
+  -- before this, and pre-setting lastPos to the new position made it measure ~0 m/s, so a
+  -- teleport-driven run always tripped the "too slow" drop-off right after SpeedCheckGrace.
 end
 
 --- Ends the wall-run (state -> NONE). carry = true hands V's run velocity to the web-sling
@@ -1046,6 +1070,10 @@ end
 
 StateHooks[States.SLINGING].onEnter = function()
   WebSlinger.IsGrappling = WebSlinger.swing.anchor ~= nil
+  -- A re-sling ends any wall-jump flight now (C2WS-T12). Otherwise a swing that attaches and
+  -- releases with carry inside one tick left wj.flying set, and the post-swing carry was treated
+  -- as the old wall-jump's flight (wall catch and chain check against the stale launch wall).
+  WebSlinger.wj.flying = false
 end
 
 StateHooks[States.SLINGING].onExit = function()
@@ -1633,6 +1661,19 @@ registerForEvent("onDraw", function()
       last.from, last.to, last.wallTime, os.clock() - last.clock, WebSlinger.transitionCount))
   else
     ImGui.Text("Last transition: (none yet)")
+  end
+
+  -- Re-sling loop verification (C2WS-T12): the recent transitions, newest last. A clean
+  -- swing -> run -> jump -> swing take shows a NONE between every two SLINGING entries.
+  ImGui.Text(string.format("SLINGING entered without NONE: %d", WebSlinger.slingWithoutNone))
+  if ImGui.CollapsingHeader("Transition log") then
+    for _, line in ipairs(WebSlinger.transitionLog) do
+      ImGui.Text(line)
+    end
+    if ImGui.Button("Clear transition log") then
+      WebSlinger.transitionLog = {}
+      WebSlinger.slingWithoutNone = 0
+    end
   end
 
   -- Debug: force each state. ImGui.Button is true only on the click frame, so each click yields at
