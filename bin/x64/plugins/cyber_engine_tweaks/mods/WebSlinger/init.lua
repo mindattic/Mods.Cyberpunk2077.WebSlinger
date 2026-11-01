@@ -19,6 +19,8 @@ local States = {
 local STATE_ORDER = { States.NONE, States.CLIMBING, States.WALLRUNNING, States.SLINGING }
 
 local WebSlinger = {
+  -- C2WS-T16: release version; tools/package.ps1 names dist/WebSlinger-<version>.zip from it.
+  version = "0.1.0",
   enabled = false,
   States = States,
   state = States.NONE,
