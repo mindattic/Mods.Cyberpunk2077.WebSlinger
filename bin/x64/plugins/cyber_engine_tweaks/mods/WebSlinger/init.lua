@@ -1,11 +1,27 @@
 -- WebSlinger: Mantis Blade wall-climb, wall-run/jump, and web-sling traversal for Cyberpunk 2077.
 -- No traversal mechanics are implemented yet. This file provides the wall-detection raycast
--- utility (C2WS-T4) every later mechanic builds on, plus its debug overlay. See docs/DESIGN.md in
+-- utility (C2WS-T4) every later mechanic builds on, plus its debug overlay, and the traversal state
+-- machine (C2WS-T5: States + SetState with per-state onEnter/onExit hooks). See docs/DESIGN.md in
 -- the repo root for the planned states and the raycast API notes.
+
+-- Traversal states (C2WS-T5). Every mechanic reads and changes the current state only through
+-- WebSlinger.state and WebSlinger.SetState; never assign WebSlinger.state directly.
+local States = {
+  NONE = "NONE",
+  CLIMBING = "CLIMBING",
+  WALLRUNNING = "WALLRUNNING",
+  SLINGING = "SLINGING",
+}
+
+-- Display/iteration order for the debug panel.
+local STATE_ORDER = { States.NONE, States.CLIMBING, States.WALLRUNNING, States.SLINGING }
 
 local WebSlinger = {
   enabled = false,
-  state = "none", -- "none" | "climbing" | "wallrunning" | "slinging"
+  States = States,
+  state = States.NONE,
+  lastTransition = nil, -- { from, to, clock, wallTime } of the most recent SetState, nil if none yet
+  transitionCount = 0,
 
   debugRaycast = false,  -- "Debug: show wall raycast" checkbox
   probeDistance = 3.0,   -- metres the forward wall probe reaches
@@ -95,6 +111,47 @@ function WebSlinger.ExecuteSmartRaycast(origin, direction, maxDistance)
   end
 
   return true, hitPos, hitNormal
+end
+
+-- Per-state hook pair. onExit(oldState) runs on the state being left, then onEnter(newState) on
+-- the state being entered. Stubs for now; later mechanics fill these in.
+local function noop() end
+local StateHooks = {}
+for _, name in ipairs(STATE_ORDER) do
+  StateHooks[name] = { onEnter = noop, onExit = noop }
+end
+WebSlinger.StateHooks = StateHooks
+
+--- Moves the traversal state machine to newState.
+-- Logs the transition and runs the old state's onExit then the new state's onEnter, each exactly
+-- once. Setting the current state again is a no-op (no log, no hooks). Unknown states are
+-- rejected with a log line. Returns true if a transition happened.
+function WebSlinger.SetState(newState)
+  if StateHooks[newState] == nil then
+    print("[WebSlinger] SetState: unknown state '" .. tostring(newState) .. "' ignored")
+    return false
+  end
+
+  local oldState = WebSlinger.state
+  if newState == oldState then return false end
+
+  -- Commit the new state before running hooks so a hook that reads WebSlinger.state (or calls
+  -- SetState itself) sees the post-transition value.
+  WebSlinger.state = newState
+  WebSlinger.transitionCount = WebSlinger.transitionCount + 1
+  WebSlinger.lastTransition = {
+    from = oldState,
+    to = newState,
+    clock = os.clock(),
+    wallTime = os.date("%H:%M:%S"),
+  }
+  print(string.format("[WebSlinger] state %s -> %s (#%d)", oldState, newState, WebSlinger.transitionCount))
+
+  local exitHook = StateHooks[oldState] and StateHooks[oldState].onExit
+  if exitHook then exitHook(oldState) end
+  local enterHook = StateHooks[newState].onEnter
+  if enterHook then enterHook(newState) end
+  return true
 end
 
 -- Runs the forward wall probe from V's chest along her horizontal facing. Called once per
@@ -204,6 +261,23 @@ registerForEvent("onDraw", function()
   local changed
   changed, WebSlinger.enabled = ImGui.Checkbox("Enabled", WebSlinger.enabled)
   ImGui.Text("State: " .. WebSlinger.state)
+  local last = WebSlinger.lastTransition
+  if last then
+    ImGui.Text(string.format("Last transition: %s -> %s at %s (%.1fs ago, #%d)",
+      last.from, last.to, last.wallTime, os.clock() - last.clock, WebSlinger.transitionCount))
+  else
+    ImGui.Text("Last transition: (none yet)")
+  end
+
+  -- Debug: force each state. ImGui.Button is true only on the click frame, so each click yields at
+  -- most one SetState call; clicking the current state is a no-op.
+  ImGui.Text("Force state:")
+  for i, name in ipairs(STATE_ORDER) do
+    if i > 1 then ImGui.SameLine() end
+    if ImGui.Button(name) then
+      WebSlinger.SetState(name)
+    end
+  end
 
   changed, WebSlinger.debugRaycast = ImGui.Checkbox("Debug: show wall raycast", WebSlinger.debugRaycast)
   if WebSlinger.debugRaycast then
