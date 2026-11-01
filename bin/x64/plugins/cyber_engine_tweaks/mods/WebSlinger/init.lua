@@ -767,6 +767,94 @@ local function drawRope()
   drawWorldPoint(drawList, s.anchor, white, 4.0)
 end
 
+-- ---------------------------------------------------------------------------------------------
+-- 'Peter Parker' intro text (C2WS-T17)
+--
+-- CET exposes no API that adds a new contact or message thread to CP77's phone (that needs new
+-- .journal resources plus localization, i.e. ArchiveXL; see docs/DESIGN.md). Until then this is the
+-- interim fallback: a CET ImGui overlay styled as a phone text bubble. Sent only from the debug
+-- panel's 'Send Peter Parker intro text' button, never automatically.
+--
+-- The two quoted lines are verified (see the ticket) and must stay word for word:
+--   "With great power comes great responsibility." -- Uncle Ben, Spider-Man (2002)
+--   "You know who I am." / "Your friendly neighborhood Spider-Man." -- Spider-Man (2002), Moondance Diner
+-- ---------------------------------------------------------------------------------------------
+
+local PeterText = {
+  visible = false,
+  sentAt = nil,  -- "HH:MM" the overlay was last sent, shown as the message timestamp
+  sender = "Peter Parker",
+  body = "Hey V -- your friendly neighborhood Spider-Man here. Heard you've picked up a few of my "
+    .. "old tricks around Night City: climbing walls on your Mantis Blades, wall-runs, wall-jumps, "
+    .. "and a real web-sling swing instead of that grapple-hook thing. Bind a swing key in the CET "
+    .. "overlay (Bindings > WebSlinger), hold it while you face the skyline, and let go to fly.\n\n"
+    .. "Uncle Ben always told me, \"With great power comes great responsibility.\" So swing safe "
+    .. "out there, V.\n\n"
+    .. "\"You know who I am.\" Your friendly neighborhood Spider-Man.\n\n"
+    .. "-- Peter Parker",
+  credit = "Quotes: Uncle Ben and Peter Parker, Spider-Man (2002).",
+}
+WebSlinger.PeterText = PeterText
+
+--- Shows the 'Peter Parker' intro text overlay (re-sending just brings it back).
+function WebSlinger.SendPeterParkerIntroText()
+  PeterText.visible = true
+  PeterText.sentAt = os.date("%H:%M")
+  print("[WebSlinger] text from " .. PeterText.sender .. " sent (overlay fallback)")
+end
+
+-- Phone-style text bubble, top-right of the screen. onDraw only.
+local function drawPeterText()
+  if not PeterText.visible then return end
+
+  local width = GetDisplayResolution()
+  local boxWidth = 420
+  ImGui.SetNextWindowPos(width - boxWidth - 40, 80, ImGuiCond.Appearing)
+  ImGui.SetNextWindowSize(boxWidth, 0, ImGuiCond.Appearing)
+
+  ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 14.0)
+  ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, 14.0, 12.0)
+  ImGui.PushStyleColor(ImGuiCol.WindowBg, 0.05, 0.06, 0.09, 0.94)
+  ImGui.PushStyleColor(ImGuiCol.Border, 0.85, 0.12, 0.15, 0.9)
+  ImGui.PushStyleColor(ImGuiCol.ChildBg, 0.11, 0.30, 0.62, 1.0)
+
+  local flags = ImGuiWindowFlags.NoTitleBar + ImGuiWindowFlags.NoCollapse + ImGuiWindowFlags.AlwaysAutoResize
+  if ImGui.Begin("WebSlinger: message from Peter Parker", flags) then
+    -- Header: contact name (the player-visible sender) and timestamp.
+    ImGui.PushStyleColor(ImGuiCol.Text, 1.0, 0.35, 0.35, 1.0)
+    ImGui.Text(PeterText.sender)
+    ImGui.PopStyleColor(1)
+    ImGui.SameLine()
+    ImGui.TextDisabled("  text message  " .. tostring(PeterText.sentAt or ""))
+    ImGui.Separator()
+
+    -- The bubble itself, sized to the wrapped text so the whole message is readable without scrolling.
+    local bubbleWidth = boxWidth - 28
+    local wrapWidth = bubbleWidth - 20
+    local _, textHeight = ImGui.CalcTextSize(PeterText.body, false, wrapWidth)
+    ImGui.PushStyleVar(ImGuiStyleVar.ChildRounding, 12.0)
+    ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, 10.0, 8.0)
+    ImGui.BeginChild("PeterTextBubble", bubbleWidth, (textHeight or 200) + 18, false,
+      ImGuiWindowFlags.AlwaysUseWindowPadding + ImGuiWindowFlags.NoScrollbar)
+    ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + wrapWidth)
+    ImGui.PushStyleColor(ImGuiCol.Text, 1.0, 1.0, 1.0, 1.0)
+    ImGui.TextWrapped(PeterText.body)
+    ImGui.PopStyleColor(1)
+    ImGui.PopTextWrapPos()
+    ImGui.EndChild()
+    ImGui.PopStyleVar(2)
+
+    ImGui.TextDisabled(PeterText.credit)
+    if ImGui.Button("Close") then
+      PeterText.visible = false
+    end
+  end
+  ImGui.End()
+
+  ImGui.PopStyleColor(3)
+  ImGui.PopStyleVar(2)
+end
+
 registerForEvent("onInit", function()
   print("[WebSlinger] loaded (wall raycast utility, state machine, web-sling base)")
 end)
@@ -797,6 +885,7 @@ registerForEvent("onDraw", function()
     drawRaycastOverlay()
   end
   drawRope()
+  drawPeterText()
 
   if not ImGui.Begin("WebSlinger") then
     ImGui.End()
@@ -860,6 +949,11 @@ registerForEvent("onDraw", function()
   cfg.reelSpeed = ImGui.SliderFloat("Reel speed", cfg.reelSpeed, 0.0, 15.0)
   cfg.gravity = ImGui.SliderFloat("Swing gravity", cfg.gravity, 5.0, 30.0)
   cfg.steerAccel = ImGui.SliderFloat("Steer accel", cfg.steerAccel, 0.0, 20.0)
+
+  ImGui.Separator()
+  if ImGui.Button("Send Peter Parker intro text") then
+    WebSlinger.SendPeterParkerIntroText()
+  end
 
   ImGui.End()
 end)

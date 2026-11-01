@@ -163,6 +163,48 @@ Not yet verified in-game. Outstanding checks: (1) swing straight into a flat wal
 8 m/s -> latch (fallback). Until C2WS-T8/T9 land, `CLIMBING` and `WALLRUNNING` have no movement or
 exit of their own, so after an impact use the debug panel's `NONE` button to return.
 
+## 'Peter Parker' intro text (C2WS-T17)
+
+The debug panel's **Send Peter Parker intro text** button sends a short in-character text from
+'Peter Parker' (the contact name and signature both read 'Peter Parker') explaining what the mod
+does and how to bind the swing key. It is manual only, never sent automatically on load.
+
+### Gap: no CET API for a real in-game text message
+
+CP77's phone messages are not runtime data a script can append to. Each contact and message
+thread is a `gameJournalContact` / `gameJournalPhoneConversation` / `gameJournalPhoneMessage`
+entry baked into the `.journal` resources, with its strings in localization `onscreens` files.
+CET's Lua layer can reach `JournalManager` (via `Game.GetJournalManager()`) and change the
+*state* of journal entries that already exist (`ChangeEntryState`, tracking), but it cannot create
+a new contact or a new message entry, so there is no way to make 'Peter Parker' appear in V's
+phone from CET alone.
+
+What a real in-game text would need:
+
+- **ArchiveXL** (a RED4ext plugin) to merge a new `.journal` resource adding a 'Peter Parker'
+  contact and a one-message conversation, plus a localization `onscreens` entry for the
+  contact name and message text (shipped in a packed `.archive` built with WolvenKit).
+- Then either CET (`Game.GetJournalManager():ChangeEntryState(...)` on the new entry's path) or
+  a small redscript/Codeware call from the button to activate the message, which fires the
+  game's own phone notification.
+
+That turns the mod from "copy one CET folder" into an archive + RED4ext dependency, so it is left
+as a follow-up. **Interim fallback:** a CET ImGui overlay styled as a phone text bubble (dark card
+with a red border, 'Peter Parker' header with a timestamp, blue bubble with the message, Close
+button), drawn top-right in `onDraw` by `drawPeterText()` and shown by
+`WebSlinger.SendPeterParkerIntroText()`. Same pattern as C2WS-T4: spike what CET exposes,
+document the gap, ship the CET-only version.
+
+### Verified quotes (keep word for word)
+
+- "With great power comes great responsibility." (Uncle Ben, *Spider-Man*, 2002)
+- "You know who I am." ... "Your friendly neighborhood Spider-Man." (Spider-Man to Mary Jane,
+  Moondance Diner, *Spider-Man*, 2002; punctuation per transcripts, no shooting script checked)
+
+Both appear unaltered in `PeterText.body` in `init.lua`; the overlay shows a one-line credit under
+the bubble. Not yet verified in-game: open the overlay and confirm the whole message is readable
+without clipping at 1080p and 4K, the header reads 'Peter Parker', and both quotes appear as above.
+
 ## Implementation approach (open question)
 
 CET's Lua layer can hook input, read/write exposed RTTI properties, and draw debug UI, but V's
