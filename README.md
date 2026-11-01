@@ -6,9 +6,9 @@ Night City.
 
 ## Status
 
-Early scaffold. No gameplay is implemented yet — this repo currently holds the project shell and
-design notes. See [`docs/DESIGN.md`](docs/DESIGN.md) for the planned mechanics and
-[`docs/USER_STORIES.md`](docs/USER_STORIES.md) for the ticket log.
+In progress. Wall-climb, wall-run, and a base web-sling are implemented and playable; wall-jump
+and further polish are still open. See [`docs/DESIGN.md`](docs/DESIGN.md) for the planned
+mechanics and [`docs/USER_STORIES.md`](docs/USER_STORIES.md) for the ticket log.
 
 ## Planned mechanics
 
