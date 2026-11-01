@@ -31,6 +31,21 @@ onto Cyberpunk 2077's V and Mantis Blades instead of web-shooters.
 - CP77 already ships a grapple hook (`PlayerPuppet` traversal states) — first implementation pass
   should check how much of that state machine can be reused vs. needs a parallel custom state.
 
+## Wall detection (C2WS-T4)
+
+`WebSlinger.ExecuteSmartRaycast(origin, direction, maxDistance)` in `init.lua` is the one source
+of truth for "is there a wall here, which way does it face". It uses CET's exposed
+`Game.GetSpatialQueriesSystem():SyncRaycastByCollisionGroup(from, to, group, staticOnly, dynamic)`
+against the `Static` and `Terrain` collision groups, keeps the nearest hit, and returns
+`(hit, hitPos, hitNormal)`. The normal is normalized and flipped if needed so it always points out
+of the wall toward the caster. No RED4ext plugin was needed for this query.
+
+The probe runs at most once per `onUpdate` tick (only while the mod is enabled or the debug
+overlay is on); `onDraw` only reads the stored result. The "Debug: show wall raycast" checkbox draws
+the ray (red on miss, green to the hit point), the hit point, and a yellow 0.5 m normal line,
+projected with `Game.GetCameraSystem():ProjectPoint`. The panel also shows a smoothed frame time
+and raycast cost so the per-tick cost can be compared against the baseline in-game.
+
 ## Implementation approach (open question)
 
 CET's Lua layer can hook input, read/write exposed RTTI properties, and draw debug UI, but V's
