@@ -152,7 +152,10 @@ WebSlinger.wallrun = {
   AntiGravityZ = 2.5,           -- vertical velocity pinned for the whole run (no sag, slight rise)
   CameraTiltDeg = 10.0,         -- camera roll on entry, away from the wall
   CameraTiltTime = 0.3,         -- blend time of the tilt in and back to neutral
-  MaxWallRunTime = 4.0,         -- hard cap on one run before V drops off
+  WallRunMaxDuration = 3.0,     -- seconds from InitiateWallRun until V drops off (C2WS-T10)
+  SpeedCheckGrace = 0.25,       -- seconds after entry before the measured-speed drop-off is checked
+  BrakeDecel = 12.0,            -- m/s^2 shed from the run speed while V holds back (MoveY < 0)
+  BrakeInputThreshold = 0.5,    -- MoveY at or below -this counts as holding back
   WallProbeDistance = 1.6,      -- per-tick "still on the wall" probe reach, into the wall
   WallStandoff = 0.45,          -- teleport fallback keeps V's centre this far off the wall plane
   BlockedProbeDistance = 1.0,   -- an obstacle this close ahead along the run ends it
@@ -169,7 +172,8 @@ WebSlinger.run = {
   dir = nil,            -- Vector4 flat unit run direction along the wall
   speed = 0.0,          -- run speed along the wall, fixed at entry
   side = 0,             -- +1 wall on V's right, -1 on her left
-  time = 0.0,
+  time = 0.0,           -- seconds since InitiateWallRun; the run ends at WallRunMaxDuration
+  measuredSpeed = 0.0,  -- V's measured horizontal speed this tick (C2WS-T10 drop-off check)
   pos = nil,            -- simulated feet position, teleport fallback only
   vel = nil,            -- last velocity applied { x, y, z }
   teleportMode = false, -- true when SetLinearVelocity is off or failed this run
@@ -735,7 +739,8 @@ function WebSlinger.InitiateWallRun(wallNormal, currentVelocity, hitPos, manual)
   end
   -- The wall lies along -n from V; her right-hand side when facing the run direction is (dir.y, -dir.x).
   r.side = (-n.x * wallParallelDir.y + n.y * wallParallelDir.x) > 0 and 1 or -1
-  r.time = 0.0
+  r.time = 0.0  -- starts the WallRunMaxDuration timer (C2WS-T10)
+  r.measuredSpeed = r.speed
   r.teleportMode = not cfg.UseLocomotionVelocity
   if player ~= nil then
     local p = player:GetWorldPosition()
@@ -754,7 +759,8 @@ end
 
 --- One wall-run tick (onUpdate, while WALLRUNNING): re-probes the wall, follows its normal round
 -- gentle curves, and re-applies the run velocity so V can't slip off mid-run. Ends the run when
--- the wall runs out, something blocks the way ahead, or MaxWallRunTime passes.
+-- the wall runs out, something blocks the way ahead, WallRunMaxDuration passes, or V's speed drops
+-- below impact.MinimumWallRunSpeed (C2WS-T10).
 function WebSlinger.UpdateWallHangPhysics(deltaTime)
   local r, cfg = WebSlinger.run, WebSlinger.wallrun
   local player = Game.GetPlayer()
@@ -763,9 +769,29 @@ function WebSlinger.UpdateWallHangPhysics(deltaTime)
     return
   end
 
+  -- Duration drop-off: no input needed, V just falls once the timer elapses.
   r.time = r.time + deltaTime
-  if r.time >= cfg.MaxWallRunTime then
-    endWallRun("time cap", true)
+  if r.time >= cfg.WallRunMaxDuration then
+    endWallRun("duration elapsed", true)
+    return
+  end
+
+  -- Speed drop-off: holding back sheds run speed; the check also uses V's measured speed (from
+  -- position deltas, after a short grace so the smoothed estimate can catch up with the entry
+  -- speed), so a run stalled by geometry or a velocity write the engine ignores ends too.
+  if WebSlinger.climbing.moveY <= -cfg.BrakeInputThreshold then
+    r.speed = math.max(0.0, r.speed - cfg.BrakeDecel * deltaTime)
+  end
+  local speed = r.speed
+  if r.time >= cfg.SpeedCheckGrace then
+    local e = WebSlinger.swing.estVel
+    r.measuredSpeed = math.sqrt(e.x * e.x + e.y * e.y)
+    speed = math.min(speed, r.measuredSpeed)
+  else
+    r.measuredSpeed = speed
+  end
+  if speed < WebSlinger.impact.MinimumWallRunSpeed then
+    endWallRun(string.format("too slow (%.1f m/s)", speed), true)
     return
   end
 
@@ -1529,8 +1555,10 @@ registerForEvent("onDraw", function()
   local r, wr = WebSlinger.run, WebSlinger.wallrun
   ImGui.Text("Wall-run: press jump with a wall to your left/right, or glance off one mid-swing")
   if WebSlinger.state == States.WALLRUNNING and r.vel ~= nil then
-    ImGui.Text(string.format("Running: %.2f s   Speed %.1f m/s   Mode: %s", r.time, r.speed,
-      r.teleportMode and "teleport" or "SetLinearVelocity"))
+    ImGui.Text(string.format("Running: %.2f s   Remaining: %.2f s   Mode: %s", r.time,
+      math.max(0.0, wr.WallRunMaxDuration - r.time), r.teleportMode and "teleport" or "SetLinearVelocity"))
+    ImGui.Text(string.format("Speed %.1f m/s (measured %.1f, drop-off below %.1f)", r.speed,
+      r.measuredSpeed, WebSlinger.impact.MinimumWallRunSpeed))
   end
   ImGui.Text("Last wall-run: " .. tostring(r.lastEntry))
   ImGui.Text("Last wall-run end: " .. tostring(r.lastEnd))
@@ -1539,7 +1567,8 @@ registerForEvent("onDraw", function()
   wr.StickyForce = ImGui.SliderFloat("Wall-run sticky force", wr.StickyForce, 0.0, 5.0)
   wr.AntiGravityZ = ImGui.SliderFloat("Wall-run anti-gravity Z", wr.AntiGravityZ, -2.0, 6.0)
   wr.CameraTiltDeg = ImGui.SliderFloat("Wall-run camera tilt", wr.CameraTiltDeg, 0.0, 25.0)
-  wr.MaxWallRunTime = ImGui.SliderFloat("Wall-run max time", wr.MaxWallRunTime, 1.0, 10.0)
+  wr.WallRunMaxDuration = ImGui.SliderFloat("Wall-run max duration", wr.WallRunMaxDuration, 0.5, 10.0)
+  wr.BrakeDecel = ImGui.SliderFloat("Wall-run brake decel", wr.BrakeDecel, 0.0, 40.0)
   wr.ManualTriggerDistance = ImGui.SliderFloat("Wall-run jump reach", wr.ManualTriggerDistance, 0.5, 4.0)
 
   ImGui.Separator()

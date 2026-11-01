@@ -286,7 +286,20 @@ so the hand-off never injects velocity and momentum is conserved. The run veloci
 (+2.5). `UpdateWallHangPhysics(dt)` runs every `onUpdate` tick while `WALLRUNNING`: it re-probes the
 wall along `-normal` (`WallProbeDistance`, 1.6 m), refreshes the normal and run direction (so gentle
 curves are followed), and re-applies the velocity. The run ends (state -> `NONE`) when the probe
-misses (end of the wall), a wall blocks the way ahead, or `MaxWallRunTime` (4 s) passes.
+misses (end of the wall), a wall blocks the way ahead, or one of the drop-offs below fires.
+
+**Duration / speed drop-off (C2WS-T10).** `InitiateWallRun` zeroes `run.time`; each tick of
+`UpdateWallHangPhysics` adds `dt` and exits `WALLRUNNING` -> `NONE` (V falls, with no input needed)
+once it reaches `WallRunMaxDuration` (3 s). Independently, the run ends immediately when V's speed
+drops below `impact.MinimumWallRunSpeed` (8 m/s), the same threshold that routes a swing impact into
+a run. "Speed" is the lower of the run speed and V's measured horizontal speed (the smoothed
+position-delta estimate `swing.estVel`, checked only after `SpeedCheckGrace`, 0.25 s, so the estimate
+can catch up with the entry speed). Holding back (`MoveY <= -BrakeInputThreshold`, 0.5) sheds run
+speed at `BrakeDecel` (12 m/s^2), which is how V slows down mid-run on purpose; a run stalled by
+geometry, or a velocity write the engine ignores, trips the measured-speed check. The debug panel
+shows elapsed and remaining run time plus run and measured speed while `WALLRUNNING`, with sliders for
+`WallRunMaxDuration` and `BrakeDecel`. Not yet verified in-game: (1) start a run and do nothing — V
+drops off at 3 s ("duration elapsed"); (2) hold back mid-run — V drops off early ("too slow").
 
 Velocity is written with `player:GetLocomotionComponent():SetLinearVelocity(...)` as the ticket
 specifies. That call is not confirmed to exist in CET's RTTI, so it is `pcall`-guarded: if it errors
