@@ -112,6 +112,33 @@ local WebSlinger = {
     lastImpact = "(none yet)",  -- one-line log of the last impact decision, for the panel
     impactCount = 0,
   },
+
+  -- Wall-climb (C2WS-T8) tunables. Distances in metres, speeds in m/s.
+  climb = {
+    speedUp = 3.0,          -- climbing up the wall
+    speedDown = 4.0,        -- climbing down the wall
+    speedStrafe = 3.0,      -- sideways along the wall
+    standoff = 0.45,        -- V's feet are held this far out from the wall surface
+    probeHeight = 1.2,      -- the stick probe starts this far above V's feet (chest)
+    stickDistance = 1.0,    -- probe reaches standoff + this into the wall; a miss means an edge
+    minWallNormal2D = 0.5,  -- surfaces flatter than this (ledges, slopes) are not climbable walls
+    jumpOutSpeed = 6.0,     -- climb-jump: speed away from the wall
+    jumpUpSpeed = 7.0,      -- climb-jump: upward speed
+    mantleForward = 0.8,    -- top edge: how far over the ledge V is placed
+    mantleReach = 2.5,      -- top edge: how far down from above the ledge the landing probe looks
+  },
+
+  -- Live wall-climb state. Written by the onUpdate tick, the CLIMBING hooks and the input observer.
+  climbing = {
+    pos = nil,          -- Vector4 V's feet position while climbing
+    normal = nil,       -- Vector4 flat unit wall normal, pointing out of the wall
+    moveX = 0.0,        -- latest MoveX axis (strafe, -1..1), from PlayerPuppet:OnAction
+    moveY = 0.0,        -- latest MoveY axis (up/down, -1..1)
+    jumpQueued = false, -- Jump pressed while CLIMBING; consumed by the next climb tick
+    startZ = 0.0,       -- feet height on entering CLIMBING, for the "climbed" readout
+    invulnerable = false,  -- true while WebSlinger holds the god-mode flag (see docs/DESIGN.md)
+    lastExit = "(none yet)",
+  },
 }
 
 -- Collision groups the probe tests against. Walls are static geometry; terrain covers rock faces.
@@ -537,6 +564,8 @@ function WebSlinger.StopGrapple(reason)
 end
 
 --- Hands V to the wall-climb mechanic (C2WS-T8): records the wall, enters CLIMBING.
+-- No equipment check of any kind: the climb is a permanent ability the mod grants, so this never
+-- queries Mantis Blades, Monowire, or any other cyberware slot.
 function WebSlinger.TriggerWallLatch(wallNormal2D, hitPos, velocity)
   local w = WebSlinger.wall
   w.normal, w.hitPos, w.velocity = wallNormal2D, hitPos, velocity
@@ -680,6 +709,229 @@ end
 registerInput("webslinger_swing", "Web-sling (hold to swing, release to let go)", function(isDown)
   WebSlinger.swing.keyHeld = isDown and true or false
 end)
+
+-- ---------------------------------------------------------------------------------------------
+-- Wall-climb (C2WS-T8), flavoured as a Mantis Blade climb.
+--
+-- A built-in ability of the mod: nothing here (or in TriggerWallLatch) ever checks V's equipped
+-- cyberware. While CLIMBING, V's feet position is owned by this tick and written back with the
+-- teleportation facility (the same mechanism the web-sling uses), which is what suspends native
+-- gravity; fall damage is suppressed with a WebSlinger-owned god-mode flag for exactly the time
+-- spent in CLIMBING. Directional input moves V in the wall's plane; a probe into the wall at the
+-- new position decides whether there is still wall there (an edge exits to NONE instead of letting
+-- V move past it). Jump is a climb-jump: outward + upward impulse handed to the momentum carry.
+-- ---------------------------------------------------------------------------------------------
+
+local CLIMB_GODMODE_REASON = "WebSlinger.Climb"
+
+-- Toggles the fall-damage suppression flag. Invulnerable god mode is added under WebSlinger's own
+-- reason name, so removing it never touches god mode from any other source (debug menus, quests).
+local function setClimbInvulnerable(player, on)
+  local c = WebSlinger.climbing
+  if on == c.invulnerable then return end
+  local ok = pcall(function()
+    local gms = Game.GetGodModeSystem()
+    local id = player:GetEntityID()
+    if on then
+      gms:AddGodMode(id, gameGodModeType.Invulnerable, CName.new(CLIMB_GODMODE_REASON))
+    else
+      gms:RemoveGodMode(id, gameGodModeType.Invulnerable, CName.new(CLIMB_GODMODE_REASON))
+    end
+  end)
+  if ok then
+    c.invulnerable = on
+  else
+    print("[WebSlinger] climb: god-mode toggle failed (" .. (on and "add" or "remove") .. ")")
+    if not on then c.invulnerable = false end
+  end
+end
+
+-- Flattens a surface normal to a unit wall normal (z = 0), or nil if the surface is not wall-like.
+local function wallNormalFrom(hitNormal)
+  local n2 = math.sqrt(hitNormal.x * hitNormal.x + hitNormal.y * hitNormal.y)
+  if n2 < WebSlinger.climb.minWallNormal2D then return nil end
+  return Vector4.new(hitNormal.x / n2, hitNormal.y / n2, 0.0, 0.0)
+end
+
+-- Probes into the wall (along -normal) from chest height above feet position p. Returns the hit
+-- point and the refreshed flat wall normal, or nil, nil when there is no wall there (an edge).
+local function probeWall(p, normal)
+  local cfg = WebSlinger.climb
+  local origin = vec4(p.x, p.y, p.z + cfg.probeHeight)
+  local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(origin,
+    Vector4.new(-normal.x, -normal.y, 0.0, 0.0), cfg.standoff + cfg.stickDistance)
+  if not hit then return nil, nil end
+  local n = wallNormalFrom(hitNormal)
+  if n == nil then return nil, nil end
+  return hitPos, n
+end
+
+-- Leaves CLIMBING. vel (optional) is handed to the web-sling momentum carry so a climb-jump flies
+-- an arc under the mod's gravity; without it, native physics takes V from where she is.
+local function exitClimb(reason, vel)
+  local c, s = WebSlinger.climbing, WebSlinger.swing
+  c.lastExit = reason
+  print("[WebSlinger] climb exit: " .. reason)
+  WebSlinger.SetState(States.NONE)
+  if vel ~= nil and c.pos ~= nil then
+    s.pos = vec4(c.pos.x, c.pos.y, c.pos.z)
+    s.vel = { x = vel.x, y = vel.y, z = vel.z }
+    s.estVel = { x = vel.x, y = vel.y, z = vel.z }
+    s.carry, s.carryTime = true, 0.0
+  end
+end
+
+-- Top edge: try to put V on top of the ledge she just climbed past. Returns true if placed.
+local function tryMantle(player, c)
+  local cfg = WebSlinger.climb
+  local n = c.normal
+  local over = vec4(c.pos.x - n.x * (cfg.standoff + cfg.mantleForward),
+    c.pos.y - n.y * (cfg.standoff + cfg.mantleForward),
+    c.pos.z + cfg.probeHeight + 1.0)
+  local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(over, Vector4.new(0.0, 0.0, -1.0, 0.0), cfg.mantleReach)
+  if not hit or hitNormal.z < 0.6 then return false end
+  c.pos = vec4(hitPos.x, hitPos.y, hitPos.z)
+  placeV(player, c.pos)
+  return true
+end
+
+StateHooks[States.CLIMBING].onEnter = function()
+  local c, s, cfg = WebSlinger.climbing, WebSlinger.swing, WebSlinger.climb
+  local player = Game.GetPlayer()
+  if player == nil then
+    c.lastExit = "no player on enter"
+    WebSlinger.SetState(States.NONE)
+    return
+  end
+
+  local pos = player:GetWorldPosition()
+  local normal = WebSlinger.wall.normal
+  if normal == nil then
+    -- Entered without an impact (e.g. the debug Force state button): use the wall V is facing.
+    local fwd = player:GetWorldForward()
+    local flat = normalized(Vector4.new(fwd.x, fwd.y, 0.0, 0.0)) or Vector4.new(0.0, 1.0, 0.0, 0.0)
+    local hit, _, hitNormal = WebSlinger.ExecuteSmartRaycast(
+      vec4(pos.x, pos.y, pos.z + cfg.probeHeight), flat, WebSlinger.probeDistance)
+    normal = hit and wallNormalFrom(hitNormal) or nil
+  end
+
+  local hitPos, n = nil, nil
+  if normal ~= nil then
+    -- Allow a slightly longer reach on entry: the impact probe may have fired up to 2 m out.
+    local origin = vec4(pos.x, pos.y, pos.z + cfg.probeHeight)
+    local hit, hp, hn = WebSlinger.ExecuteSmartRaycast(origin, Vector4.new(-normal.x, -normal.y, 0.0, 0.0),
+      WebSlinger.impact.WallCheckDistance + cfg.standoff + cfg.stickDistance)
+    if hit then hitPos, n = hp, wallNormalFrom(hn) end
+  end
+  if hitPos == nil or n == nil then
+    c.lastExit = "no climbable wall on enter"
+    WebSlinger.SetState(States.NONE)
+    return
+  end
+
+  c.normal = n
+  c.pos = vec4(hitPos.x + n.x * cfg.standoff, hitPos.y + n.y * cfg.standoff, pos.z)
+  c.startZ = pos.z
+  c.jumpQueued = false
+  -- Zero residual velocity into the wall: nothing carries over from the swing or the fall.
+  s.carry, s.carryTime = false, 0.0
+  s.vel = { x = 0.0, y = 0.0, z = 0.0 }
+  s.estVel = { x = 0.0, y = 0.0, z = 0.0 }
+  WebSlinger.wall.velocity = { x = 0.0, y = 0.0, z = 0.0 }
+  setClimbInvulnerable(player, true)
+  placeV(player, c.pos)
+end
+
+StateHooks[States.CLIMBING].onExit = function()
+  local c = WebSlinger.climbing
+  c.jumpQueued = false
+  local player = Game.GetPlayer()
+  if player ~= nil then
+    setClimbInvulnerable(player, false)
+  else
+    c.invulnerable = false
+  end
+end
+
+--- One wall-climb tick while CLIMBING: climb-jump, then directional movement in the wall plane
+-- with edge detection, then writes V's position. onUpdate only.
+function WebSlinger.UpdateClimb(dt)
+  if WebSlinger.state ~= States.CLIMBING then return end
+  local c, cfg = WebSlinger.climbing, WebSlinger.climb
+  local player = Game.GetPlayer()
+  if player == nil or c.pos == nil or c.normal == nil then
+    exitClimb("lost player or wall", nil)
+    return
+  end
+  local n = c.normal
+
+  if c.jumpQueued then
+    c.jumpQueued = false
+    exitClimb("climb-jump", {
+      x = n.x * cfg.jumpOutSpeed,
+      y = n.y * cfg.jumpOutSpeed,
+      z = cfg.jumpUpSpeed,
+    })
+    return
+  end
+
+  -- Wall-plane axes: up is world up; right is to V's right while she faces into the wall.
+  local rx, ry = -n.y, n.x
+  local my = c.moveY
+  local vertical = my * (my > 0 and cfg.speedUp or cfg.speedDown)
+  local lateral = c.moveX * cfg.speedStrafe
+
+  if math.abs(vertical) > 1e-3 or math.abs(lateral) > 1e-3 then
+    local target = vec4(c.pos.x + rx * lateral * dt, c.pos.y + ry * lateral * dt, c.pos.z + vertical * dt)
+
+    -- Something solid in the way along the wall (overhang, adjacent wall): stay put this tick.
+    local from = vec4(c.pos.x, c.pos.y, c.pos.z + cfg.probeHeight)
+    local dx, dy, dz = target.x - c.pos.x, target.y - c.pos.y, target.z - c.pos.z
+    local step = math.sqrt(dx * dx + dy * dy + dz * dz)
+    local blocked = WebSlinger.ExecuteSmartRaycast(from, Vector4.new(dx, dy, dz, 0.0), step + 0.3)
+
+    if not blocked then
+      if vertical < 0.0 and isGrounded(target) then
+        exitClimb("reached the ground", nil)
+        return
+      end
+      local hitPos, newNormal = probeWall(target, n)
+      if hitPos == nil then
+        -- Past the wall's edge. Never move V there: over the top she mantles onto the ledge if
+        -- there is one, otherwise (and at side/bottom edges) she lets go where she is.
+        if vertical > 0.0 and tryMantle(player, c) then
+          exitClimb("mantled over the top", nil)
+        else
+          exitClimb("reached the wall's edge", nil)
+        end
+        return
+      end
+      -- Follow the surface: refresh the normal and keep V at the standoff distance from it.
+      c.normal = newNormal
+      c.pos = vec4(hitPos.x + newNormal.x * cfg.standoff, hitPos.y + newNormal.y * cfg.standoff, target.z)
+    end
+  end
+
+  placeV(player, c.pos)
+  WebSlinger.swing.lastPos = vec4(c.pos.x, c.pos.y, c.pos.z)
+end
+
+-- Movement axes and Jump come from the game's own input actions, so climbing uses whatever the
+-- player has bound to move/jump (keyboard or gamepad). Registered in onInit.
+local function observeClimbInput()
+  Observe("PlayerPuppet", "OnAction", function(_, action)
+    local c = WebSlinger.climbing
+    local name = Game.NameToString(ListenerAction.GetName(action))
+    if name == "MoveX" then
+      c.moveX = ListenerAction.GetValue(action)
+    elseif name == "MoveY" then
+      c.moveY = ListenerAction.GetValue(action)
+    elseif name == "Jump" and WebSlinger.state == States.CLIMBING then
+      local ok, kind = pcall(function() return ListenerAction.GetType(action).value end)
+      if ok and kind == "BUTTON_PRESSED" then c.jumpQueued = true end
+    end
+  end)
+end
 
 -- Runs the forward wall probe from V's chest along her horizontal facing. Called once per
 -- onUpdate tick, never from onDraw.
@@ -859,6 +1111,7 @@ end
 
 registerForEvent("onInit", function()
   print("[WebSlinger] loaded (wall raycast utility, state machine, web-sling base)")
+  observeClimbInput()
 end)
 
 registerForEvent("onUpdate", function(deltaTime)
@@ -872,14 +1125,17 @@ registerForEvent("onUpdate", function(deltaTime)
 
   if not WebSlinger.enabled then
     if WebSlinger.state == States.SLINGING then releaseSling("mod disabled", false) end
+    if WebSlinger.state == States.CLIMBING then exitClimb("mod disabled", nil) end
     WebSlinger.swing.carry = false
     WebSlinger.swing.lastPos = nil
     return
   end
 
   -- Clamp the step so a hitch (menu, loading) can't fling V across the map in one tick.
-  updateSling(math.min(deltaTime, 0.05))
-  -- TODO: wall-climb / wall-run / wall-jump mechanics go here.
+  local dt = math.min(deltaTime, 0.05)
+  updateSling(dt)
+  WebSlinger.UpdateClimb(dt)
+  -- TODO: wall-run / wall-jump mechanics go here.
 end)
 
 registerForEvent("onDraw", function()
@@ -947,6 +1203,16 @@ registerForEvent("onDraw", function()
   ic.WallCheckDistance = ImGui.SliderFloat("Wall check distance", ic.WallCheckDistance, 0.5, 6.0)
   ic.WallLatchAngleThreshold = ImGui.SliderFloat("Latch angle threshold", ic.WallLatchAngleThreshold, 0.0, 1.0)
   ic.MinimumWallRunSpeed = ImGui.SliderFloat("Min wall-run speed", ic.MinimumWallRunSpeed, 0.0, 25.0)
+  local c, cc = WebSlinger.climbing, WebSlinger.climb
+  if WebSlinger.state == States.CLIMBING and c.pos ~= nil then
+    ImGui.Text(string.format("Climb: %.1f m above entry   Move (%.2f, %.2f)   No fall damage: %s",
+      c.pos.z - c.startZ, c.moveX, c.moveY, tostring(c.invulnerable)))
+  end
+  ImGui.Text("Last climb exit: " .. tostring(c.lastExit))
+  cc.speedUp = ImGui.SliderFloat("Climb speed up", cc.speedUp, 0.5, 10.0)
+  cc.speedStrafe = ImGui.SliderFloat("Climb strafe speed", cc.speedStrafe, 0.5, 10.0)
+  cc.jumpOutSpeed = ImGui.SliderFloat("Climb-jump out", cc.jumpOutSpeed, 0.0, 15.0)
+  cc.jumpUpSpeed = ImGui.SliderFloat("Climb-jump up", cc.jumpUpSpeed, 0.0, 15.0)
   cfg.AnchorMaxDistance = ImGui.SliderFloat("Anchor max distance", cfg.AnchorMaxDistance, 10.0, 100.0)
   cfg.reelSpeed = ImGui.SliderFloat("Reel speed", cfg.reelSpeed, 0.0, 15.0)
   cfg.gravity = ImGui.SliderFloat("Swing gravity", cfg.gravity, 5.0, 30.0)

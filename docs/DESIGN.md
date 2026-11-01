@@ -6,11 +6,10 @@ onto Cyberpunk 2077's V and Mantis Blades instead of web-shooters.
 ## Mechanics
 
 ### Wall climb
-- Trigger: Mantis Blades equipped, melee-stance input held while facing a wall within grab range.
+- Trigger: a head-on (or too slow to wall-run) wall impact during a swing (C2WS-T7). "Mantis
+  Blade climb" is flavour only: the climb is a built-in ability with no cyberware check.
 - While climbing: disable normal gravity/fall damage, allow directional movement along the
-  surface, allow a climb-jump off the wall.
-- Needs a way to tell "climbable" surfaces from the game's existing wall tags/collision data —
-  open question for the first implementation ticket.
+  surface, allow a climb-jump off the wall. Implemented in C2WS-T8 (see below).
 
 ### Wall run
 - Trigger: approach a wall at or above a minimum lateral speed, airborne, facing within some
@@ -160,8 +159,67 @@ shown as "Last wall impact" in the debug panel, which also has sliders for the t
 
 Not yet verified in-game. Outstanding checks: (1) swing straight into a flat wall face -> latch;
 (2) swing past a wall at a shallow angle above 8 m/s -> wall-run; (3) the same shallow angle below
-8 m/s -> latch (fallback). Until C2WS-T8/T9 land, `CLIMBING` and `WALLRUNNING` have no movement or
-exit of their own, so after an impact use the debug panel's `NONE` button to return.
+8 m/s -> latch (fallback). Until C2WS-T9 lands, `WALLRUNNING` has no movement or exit of its own,
+so after a wall-run impact use the debug panel's `NONE` button to return.
+
+## Wall-latch and wall-climb (C2WS-T8)
+
+### No equipment gate
+
+`TriggerWallLatch()` and the `CLIMBING` hooks never query Mantis Blades, Monowire or any other
+cyberware slot. The climb is a permanent ability the mod grants; "Mantis Blade climb" survives only
+as flavour in comments and docs.
+
+### Entering `CLIMBING`: gravity, fall damage, residual velocity
+
+The `CLIMBING` `onEnter` hook re-probes into the wall along `-wall.normal` (or, if entered from the
+debug panel with no impact recorded, along V's facing) and fails back to `NONE` if no wall-like
+surface is there. On success:
+
+- **Gravity:** there is no native "disable gravity" flag CET can poke on V's character controller,
+  so, like the web-sling, `CLIMBING` owns V's feet position (`WebSlinger.climbing.pos`) and writes
+  it back every tick with `Game.GetTeleportationFacility():Teleport(...)`. Pinning the position each
+  tick is what suspends gravity.
+- **Fall damage:** the exact flag toggled is god mode **`gameGodModeType.Invulnerable`**, added via
+  `Game.GetGodModeSystem():AddGodMode(player:GetEntityID(), gameGodModeType.Invulnerable,
+  "WebSlinger.Climb")` on enter and removed with `RemoveGodMode(...)` with the same reason name on
+  exit (any exit, including the debug buttons and disabling the mod). Using WebSlinger's own reason
+  name means removing it never clears god mode from any other source. Side effect: V is also immune
+  to combat damage while on a wall. `climbing.invulnerable` mirrors the flag and is shown in the panel.
+- **Residual velocity:** the swing velocity, its carry, the position-delta velocity estimate and
+  `wall.velocity` are all zeroed, and V is snapped to `climb.standoff` (0.45 m) out from the surface.
+
+### Movement in the wall plane
+
+Input comes from the game's own `MoveX` / `MoveY` / `Jump` actions (observed on
+`PlayerPuppet:OnAction`), so climbing uses the player's normal move/jump binds on keyboard or
+gamepad. Each tick, `MoveY` moves V up (`speedUp`, 3 m/s) or down (`speedDown`, 4 m/s) and `MoveX`
+strafes along the wall's tangent (`speedStrafe`, 3 m/s). Before moving:
+
+1. A ray along the step checks for something solid in the way (overhang, inside corner); if blocked,
+   V stays put that tick.
+2. Moving down onto walkable ground ends the climb (`NONE`).
+3. A stick probe from chest height at the new position casts into the wall (`standoff +
+   stickDistance`). A hit refreshes the wall normal (so curved or faceted walls are followed) and
+   V is held at the standoff. **A miss means the wall's edge:** V is never moved there; over the top
+   she is placed on the ledge if a downward probe finds walkable ground (mantle), otherwise she
+   lets go where she is (`NONE`, native physics). This is what stops her clipping past an edge.
+
+### Climb-jump
+
+Jump while `CLIMBING` exits to `NONE` and hands V to the web-sling momentum carry with velocity
+`wallNormal * jumpOutSpeed (6) + up * jumpUpSpeed (7)`, so she arcs off the wall under the mod's
+gravity and then falls normally. From `NONE` she can fire a new web-sling or (C2WS-T11) latch onto
+the next wall.
+
+### Verification status
+
+Not yet verified in-game; the agent that implemented this could not run the game. Outstanding
+check from the ticket, with nothing in V's cyberware slots: climb at least 10 m up a building face
+("Climb: x m above entry" in the panel), strafe both ways without sliding off, then climb-jump off
+into a normal fall. Also confirm `AddGodMode`/`RemoveGodMode` succeed (a failed toggle prints
+`climb: god-mode toggle failed`) and that the `MoveX`/`MoveY` sign conventions give up = forward
+and right = right; flip in `UpdateClimb` if not.
 
 ## 'Peter Parker' intro text (C2WS-T17)
 
