@@ -6,7 +6,8 @@
 -- angle check during a swing (C2WS-T7: latch vs. wall-run hand-off), and the wall-run itself
 -- (C2WS-T9: wall-parallel run velocity, sticky force, camera tilt, manual jump-key trigger), and the
 -- wall-jump off a climb or wall-run, chainable between facing walls (C2WS-T11), and the
--- end-to-end re-sling loop pass (C2WS-T12: state-leak fixes plus a transition log). See
+-- end-to-end re-sling loop pass (C2WS-T12: state-leak fixes plus a transition log), and the polish
+-- pass (C2WS-T13: eased wall-run camera tilt, impact shake + FOV punch on latch and wall-jump). See
 -- docs/DESIGN.md in the repo root for the states, the raycast API notes, and the design decisions.
 
 -- Traversal states (C2WS-T5). Every mechanic reads and changes the current state only through
@@ -692,10 +693,179 @@ local function setLinearVelocity(player, v)
   return ok
 end
 
-local function setCameraTilt(degrees, blendTime)
+local function rawCameraTilt(degrees, blendTime)
   pcall(function()
     Game.GetCameraSystem():SetCameraTilt(degrees, blendTime)
   end)
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Polish (C2WS-T13): eased camera tilt and impact feedback
+--
+-- The wall-run tilt is no longer one flat SetCameraTilt(target, blend) call: the mod owns the roll
+-- and eases it (smoothstep) from where it is toward the target over CameraTiltTime, writing it with
+-- a zero engine blend each tick it changes. A wall-latch impact and a wall-jump launch add a short
+-- decaying roll shake on top of that and a quick FOV punch (fast rise, eased return). The whole
+-- step is a few arithmetic ops plus at most two pcall'd engine writes, and only while an effect is
+-- live (idle ticks return at once); its own cost is timed for the debug panel next to the T1
+-- frame-time counter. Polish off = the pre-T13 behaviour (flat engine-blended tilt, no impulses).
+-- ---------------------------------------------------------------------------------------------
+
+WebSlinger.polish = {
+  Enabled = true,          -- master switch for everything below
+  ShakeAmplitudeDeg = 2.0, -- peak roll of the impact shake (latch); a jump plays JumpScale of it
+  ShakeDuration = 0.22,    -- seconds the shake takes to decay to nothing
+  ShakeFrequency = 18.0,   -- shake oscillations per second
+  FovPunchDeg = 5.0,       -- FOV added at the peak of the punch (latch); a jump plays JumpScale of it
+  FovPunchRise = 0.05,     -- seconds to reach the peak
+  FovPunchFall = 0.25,     -- seconds to ease back to the base FOV
+  JumpScale = 0.7,         -- wall-jump launch strength relative to a wall-latch impact
+}
+
+-- Live polish state. Written only by setCameraTilt, PlayImpactFeedback and updatePolish.
+WebSlinger.fx = {
+  tilt = 0.0,           -- current eased roll (degrees), before shake
+  tiltFrom = 0.0,
+  tiltTo = 0.0,
+  tiltTime = 0.0,
+  tiltDuration = 0.0,
+  applied = 0.0,        -- last roll written to the camera (tilt + shake)
+  shakeTime = nil,      -- seconds since the shake started, nil when none
+  shakeAmp = 0.0,
+  fovBase = nil,        -- FOV before the punch, restored when it ends; nil when no punch is live
+  fovTime = 0.0,
+  fovPunch = 0.0,
+  costMs = 0.0,         -- smoothed per-tick cost of updatePolish, for the frame-time check
+  lastImpulse = "(none yet)",
+  impulseCount = 0,
+}
+
+local function easeInOut(t)
+  if t <= 0.0 then return 0.0 end
+  if t >= 1.0 then return 1.0 end
+  return t * t * (3.0 - 2.0 * t)
+end
+
+local function fppCamera()
+  local player = Game.GetPlayer()
+  if player == nil then return nil end
+  local ok, cam = pcall(function() return player:GetFPPCameraComponent() end)
+  if ok then return cam end
+  return nil
+end
+
+local function setFov(value)
+  local cam = fppCamera()
+  if cam == nil then return false end
+  return pcall(function() cam:SetFOV(value) end)
+end
+
+-- Ends any FOV punch at once, putting the base FOV back.
+local function endFovPunch()
+  local fx = WebSlinger.fx
+  if fx.fovBase ~= nil then setFov(fx.fovBase) end
+  fx.fovBase, fx.fovPunch = nil, 0.0
+end
+
+--- Sets the camera roll target. With polish on, the roll eases there over blendTime (the per-tick
+-- write happens in updatePolish); with polish off it is the old flat engine-blended call.
+local function setCameraTilt(degrees, blendTime)
+  local fx = WebSlinger.fx
+  if not WebSlinger.polish.Enabled then
+    rawCameraTilt(degrees, blendTime)
+    fx.tilt, fx.tiltFrom, fx.tiltTo, fx.applied = degrees, degrees, degrees, degrees
+    fx.tiltTime, fx.tiltDuration = 0.0, 0.0
+    return
+  end
+  fx.tiltFrom, fx.tiltTo = fx.tilt, degrees
+  fx.tiltTime, fx.tiltDuration = 0.0, math.max(blendTime or 0.0, 0.0)
+end
+
+--- Impact feedback: a decaying roll shake plus an FOV punch. strength scales both (1 = a full
+-- wall-latch impact). label names the event for the debug panel.
+function WebSlinger.PlayImpactFeedback(strength, label)
+  local p, fx = WebSlinger.polish, WebSlinger.fx
+  if not p.Enabled then return end
+  fx.shakeTime, fx.shakeAmp = 0.0, p.ShakeAmplitudeDeg * strength
+  if p.FovPunchDeg * strength > 0.0 then
+    if fx.fovBase == nil then
+      local cam = fppCamera()
+      local ok, base = false, nil
+      if cam ~= nil then ok, base = pcall(function() return cam:GetFOV() end) end
+      if ok and type(base) == "number" then fx.fovBase = base end
+    end
+    if fx.fovBase ~= nil then
+      fx.fovTime, fx.fovPunch = 0.0, p.FovPunchDeg * strength
+    end
+  end
+  fx.impulseCount = fx.impulseCount + 1
+  fx.lastImpulse = string.format("#%d %s (x%.2f)%s", fx.impulseCount, label, strength,
+    fx.fovBase == nil and "  [FOV unavailable]" or "")
+end
+
+--- One polish tick (every onUpdate, also while the mod is disabled so an exit tilt still eases
+-- back). Returns immediately when nothing is animating.
+local function updatePolish(dt)
+  local p, fx = WebSlinger.polish, WebSlinger.fx
+  if not p.Enabled then
+    -- Switched off mid-effect: snap everything to its resting value once.
+    if fx.shakeTime ~= nil or fx.fovBase ~= nil or fx.applied ~= fx.tiltTo then
+      fx.shakeTime = nil
+      endFovPunch()
+      fx.tilt, fx.applied, fx.tiltDuration = fx.tiltTo, fx.tiltTo, 0.0
+      rawCameraTilt(fx.tiltTo, 0.0)
+    end
+    return
+  end
+  local tiltBusy = fx.tilt ~= fx.tiltTo or fx.applied ~= fx.tiltTo
+  if not tiltBusy and fx.shakeTime == nil and fx.fovBase == nil then return end
+  local started = os.clock()
+
+  -- Eased tilt.
+  if fx.tilt ~= fx.tiltTo then
+    fx.tiltTime = fx.tiltTime + dt
+    if fx.tiltDuration <= 0.0 or fx.tiltTime >= fx.tiltDuration then
+      fx.tilt = fx.tiltTo
+    else
+      fx.tilt = fx.tiltFrom + (fx.tiltTo - fx.tiltFrom) * easeInOut(fx.tiltTime / fx.tiltDuration)
+    end
+  end
+
+  -- Shake: a sine roll under a linear decay envelope.
+  local shake = 0.0
+  if fx.shakeTime ~= nil then
+    fx.shakeTime = fx.shakeTime + dt
+    if p.ShakeDuration <= 0.0 or fx.shakeTime >= p.ShakeDuration then
+      fx.shakeTime = nil
+    else
+      local decay = 1.0 - fx.shakeTime / p.ShakeDuration
+      shake = fx.shakeAmp * decay * math.sin(fx.shakeTime * p.ShakeFrequency * 2.0 * math.pi)
+    end
+  end
+
+  local roll = fx.tilt + shake
+  if math.abs(roll - fx.applied) > 1e-3 or (shake == 0.0 and roll ~= fx.applied) then
+    rawCameraTilt(roll, 0.0)
+    fx.applied = roll
+  end
+
+  -- FOV punch: linear rise, smoothstep fall.
+  if fx.fovBase ~= nil then
+    fx.fovTime = fx.fovTime + dt
+    local k
+    if fx.fovTime < p.FovPunchRise then
+      k = fx.fovTime / p.FovPunchRise
+    else
+      k = 1.0 - easeInOut((fx.fovTime - p.FovPunchRise) / math.max(p.FovPunchFall, 1e-3))
+    end
+    if k <= 0.0 then
+      endFovPunch()
+    elseif not setFov(fx.fovBase + fx.fovPunch * k) then
+      fx.fovBase, fx.fovPunch = nil, 0.0
+    end
+  end
+
+  fx.costMs = smooth(fx.costMs, (os.clock() - started) * 1000.0)
 end
 
 -- Probes from V's chest into the wall (along -normal). Returns the flat wall normal and hit point,
@@ -1230,6 +1400,7 @@ StateHooks[States.CLIMBING].onEnter = function()
   WebSlinger.wall.velocity = { x = 0.0, y = 0.0, z = 0.0 }
   setClimbInvulnerable(player, true)
   placeV(player, c.pos)
+  WebSlinger.PlayImpactFeedback(1.0, "wall-latch impact")  -- C2WS-T13
 end
 
 StateHooks[States.CLIMBING].onExit = function()
@@ -1382,6 +1553,7 @@ function WebSlinger.WallJump()
   wj.lastResult = string.format("#%d off %s%s", wj.jumpCount, from,
     chain and string.format(" (chain x%d)", wj.chainCount) or "")
   print("[WebSlinger] wall-jump " .. wj.lastResult)
+  WebSlinger.PlayImpactFeedback(WebSlinger.polish.JumpScale, "wall-jump launch")  -- C2WS-T13
   return true
 end
 
@@ -1614,6 +1786,9 @@ end)
 registerForEvent("onUpdate", function(deltaTime)
   WebSlinger.timing.frameMs = smooth(WebSlinger.timing.frameMs, deltaTime * 1000.0)
 
+  -- Polish (C2WS-T13) runs even while disabled so an exit tilt eases back and a punch ends cleanly.
+  updatePolish(math.min(deltaTime, 0.05))
+
   if WebSlinger.enabled or WebSlinger.debugRaycast then
     updateWallProbe()
   else
@@ -1763,6 +1938,18 @@ registerForEvent("onDraw", function()
   wjc.UpwardForce = ImGui.SliderFloat("Wall-jump upward force", wjc.UpwardForce, 0.0, 15.0)
   wjc.ChainWindow = ImGui.SliderFloat("Wall-jump chain window", wjc.ChainWindow, 0.1, 2.0)
   wjc.Cooldown = ImGui.SliderFloat("Wall-jump cooldown", wjc.Cooldown, 0.0, 2.0)
+
+  -- Polish (C2WS-T13). Compare "Frame" above with this on and off: the polish cost must not move it.
+  ImGui.Separator()
+  local pp, fx = WebSlinger.polish, WebSlinger.fx
+  pp.Enabled = ImGui.Checkbox("Polish: eased tilt + impact shake/FOV punch", pp.Enabled)
+  ImGui.Text(string.format("Polish cost: %.3f ms/tick (while animating)   Roll: %.1f deg", fx.costMs, fx.applied))
+  ImGui.Text("Last impact feedback: " .. tostring(fx.lastImpulse))
+  wr.CameraTiltTime = ImGui.SliderFloat("Wall-run tilt ease time", wr.CameraTiltTime, 0.0, 1.0)
+  pp.ShakeAmplitudeDeg = ImGui.SliderFloat("Impact shake (deg)", pp.ShakeAmplitudeDeg, 0.0, 6.0)
+  pp.ShakeDuration = ImGui.SliderFloat("Impact shake time", pp.ShakeDuration, 0.0, 1.0)
+  pp.FovPunchDeg = ImGui.SliderFloat("Impact FOV punch (deg)", pp.FovPunchDeg, 0.0, 15.0)
+  pp.JumpScale = ImGui.SliderFloat("Wall-jump feedback scale", pp.JumpScale, 0.0, 1.5)
 
   ImGui.Separator()
   if ImGui.Button("Send Peter Parker intro text") then

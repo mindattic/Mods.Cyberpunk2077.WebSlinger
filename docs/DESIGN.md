@@ -387,6 +387,34 @@ the ticket, in one continuous take: swing -> wall-run -> wall-jump -> swing agai
 wall-latch-climb -> climb-jump -> swing again, with no scripting error, no stuck state, and the
 transition log showing a `NONE` between every two `SLINGING` entries (counter still 0).
 
+## Polish: camera tilt easing, impact feedback (C2WS-T13)
+
+**Eased tilt.** The wall-run no longer makes one flat `SetCameraTilt(target, CameraTiltTime)` call.
+`setCameraTilt` now only records a target; `updatePolish` (every `onUpdate`, also while the mod is
+disabled so an exit tilt still settles) eases the mod-owned roll from where it currently is toward
+the target with a smoothstep over `CameraTiltTime` (0.3 s), writing it with a zero engine blend on
+each tick it changes. Because the ease starts from the current roll, a run that ends mid-tilt eases
+back from there instead of jumping.
+
+**Impact feedback.** `PlayImpactFeedback(strength, label)` plays a decaying sine roll shake
+(`ShakeAmplitudeDeg` 2, `ShakeDuration` 0.22 s, `ShakeFrequency` 18 Hz) added on top of the eased
+tilt, plus an FOV punch through `player:GetFPPCameraComponent():GetFOV()/SetFOV()` (+`FovPunchDeg` 5,
+linear rise over `FovPunchRise` 0.05 s, smoothstep fall over `FovPunchFall` 0.25 s, then the base FOV
+is restored exactly). It fires at full strength when `CLIMBING` is entered successfully (wall-latch
+impact) and at `JumpScale` (0.7) on every wall-jump launch. All engine calls are `pcall`-guarded; if
+the FOV calls are unavailable the panel's last-feedback line says "[FOV unavailable]" and only the
+shake plays.
+
+**Input lag.** Idle ticks return immediately; an animating tick is a handful of arithmetic ops and
+at most two engine writes, and nothing in the input path (key/jump observers, state changes) waits
+on it. Its own cost is timed (`fx.costMs`) and shown in the panel next to the T1 frame-time counter;
+the "Polish" checkbox turns it all off (back to the flat engine-blended tilt, no impulses) so the
+"Frame" readout can be compared with polish on and off. Tunables live in `WebSlinger.polish`.
+
+Not yet verified in-game (the implementing agent could not run the game). Outstanding checks: the
+tilt eases in and out with no snap; the shake and FOV punch read on a latch and a wall-jump; the
+"Frame" counter stays at its polish-off baseline with polish on.
+
 ## Implementation approach (open question)
 
 CET's Lua layer can hook input, read/write exposed RTTI properties, and draw debug UI, but V's
