@@ -4,7 +4,8 @@
 -- onEnter/onExit hooks), and the web-sling base (C2WS-T6: hold-to-swing hotkey, cone anchor
 -- search, rope-constrained pendulum physics, release with momentum carry), and the wall-impact
 -- angle check during a swing (C2WS-T7: latch vs. wall-run hand-off), and the wall-run itself
--- (C2WS-T9: wall-parallel run velocity, sticky force, camera tilt, manual jump-key trigger). See
+-- (C2WS-T9: wall-parallel run velocity, sticky force, camera tilt, manual jump-key trigger), and the
+-- wall-jump off a climb or wall-run, chainable between facing walls (C2WS-T11). See
 -- docs/DESIGN.md in the repo root for the states, the raycast API notes, and the design decisions.
 
 -- Traversal states (C2WS-T5). Every mechanic reads and changes the current state only through
@@ -123,8 +124,7 @@ local WebSlinger = {
     probeHeight = 1.2,      -- the stick probe starts this far above V's feet (chest)
     stickDistance = 1.0,    -- probe reaches standoff + this into the wall; a miss means an edge
     minWallNormal2D = 0.5,  -- surfaces flatter than this (ledges, slopes) are not climbable walls
-    jumpOutSpeed = 6.0,     -- climb-jump: speed away from the wall
-    jumpUpSpeed = 7.0,      -- climb-jump: upward speed
+    -- (jump off the wall: see WebSlinger.walljump, C2WS-T11)
     mantleForward = 0.8,    -- top edge: how far over the ledge V is placed
     mantleReach = 2.5,      -- top edge: how far down from above the ledge the landing probe looks
   },
@@ -183,6 +183,37 @@ WebSlinger.run = {
   lastEntry = "(none yet)",
   lastEnd = "(none yet)",
   count = 0,
+}
+
+-- Wall-jump (C2WS-T11) tunables. Speeds in m/s, times in seconds, distances in metres.
+WebSlinger.walljump = {
+  OutwardForce = 6.0,    -- launch speed along the wall normal (away from the wall)
+  UpwardForce = 7.0,     -- launch speed straight up
+  RunCarry = 1.0,        -- fraction of the wall-run's along-wall speed kept on a jump off a run
+  ChainWindow = 0.6,     -- a jump this soon after landing a wall-jump on a facing wall is a chain
+  Cooldown = 0.35,       -- minimum time between two wall-jumps; a chain is never blocked by it
+  FacingDot = 0.5,       -- landing wall counts as facing the launch wall if nLand . nLaunch <= -this
+  MinApproachDot = 0.3,  -- in flight, only walls V is moving into (dir . n <= -this) catch her
+  CatchDistance = 0.9,   -- in-flight wall probe reach (plus this tick's travel)
+  MinFlightTime = 0.08,  -- don't catch a wall this early in the flight (the launch wall)
+  probeHeight = 1.2,     -- in-flight wall probe starts this far above V's feet
+  minWallNormal2D = 0.5, -- hit normals flatter than this (floors, ledges) are not walls
+}
+
+-- Live wall-jump state. Written by WallJump, the in-flight landing check, and onUpdate.
+WebSlinger.wj = {
+  clock = 0.0,           -- seconds of enabled onUpdate time; the timeline for windows/cooldown
+  flying = false,        -- true from a wall-jump until V lands on a wall, the ground, or anything else
+  flightTime = 0.0,
+  launchNormal = nil,    -- Vector4 flat normal of the wall jumped off
+  launchZ = 0.0,         -- V's feet height at launch, for the per-jump height readout
+  lastJumpAt = nil,      -- wj.clock of the last wall-jump
+  landedAt = nil,        -- wj.clock when a wall-jump flight was caught by a wall
+  landedFacing = false,  -- ... and whether that wall roughly faced the launch wall (chain-eligible)
+  chainCount = 0,        -- consecutive chained wall-jumps (0 = the last jump was not a chain)
+  jumpCount = 0,
+  lastResult = "(none yet)",
+  lastLanding = "(none yet)",
 }
 
 local function vec4(x, y, z)
@@ -887,7 +918,8 @@ end
 -- bound to jump. Registered in onInit; only queues, the onUpdate tick does the work.
 local function observeWallRunJump()
   Observe("PlayerPuppet", "OnAction", function(_, action)
-    if WebSlinger.state ~= States.NONE then return end
+    -- NONE: manual wall-run trigger. WALLRUNNING: wall-jump off the run (C2WS-T11).
+    if WebSlinger.state ~= States.NONE and WebSlinger.state ~= States.WALLRUNNING then return end
     local ok, isJump = pcall(function()
       return Game.NameToString(ListenerAction.GetName(action)) == "Jump"
         and ListenerAction.GetType(action).value == "BUTTON_PRESSED"
@@ -896,13 +928,14 @@ local function observeWallRunJump()
   end)
 end
 
--- One wall-run tick: consumes a queued jump press (manual trigger) and runs the wall-run physics.
--- onUpdate only.
+-- One wall-run tick: consumes a queued jump press (manual trigger from NONE, wall-jump while
+-- running) and runs the wall-run physics. onUpdate only.
 local function updateWallRun(dt)
   local r = WebSlinger.run
   local jump = r.jumpQueued
   r.jumpQueued = false
   if WebSlinger.state == States.WALLRUNNING then
+    if jump and WebSlinger.WallJump() then return end
     WebSlinger.UpdateWallHangPhysics(dt)
   elseif jump and WebSlinger.state == States.NONE then
     WebSlinger.TryManualWallRun()
@@ -1048,7 +1081,7 @@ end)
 -- gravity; fall damage is suppressed with a WebSlinger-owned god-mode flag for exactly the time
 -- spent in CLIMBING. Directional input moves V in the wall's plane; a probe into the wall at the
 -- new position decides whether there is still wall there (an edge exits to NONE instead of letting
--- V move past it). Jump is a climb-jump: outward + upward impulse handed to the momentum carry.
+-- V move past it). Jump is a wall-jump (C2WS-T11): outward + upward impulse handed to the momentum carry.
 -- ---------------------------------------------------------------------------------------------
 
 local CLIMB_GODMODE_REASON = "WebSlinger.Climb"
@@ -1182,7 +1215,7 @@ StateHooks[States.CLIMBING].onExit = function()
   end
 end
 
---- One wall-climb tick while CLIMBING: climb-jump, then directional movement in the wall plane
+--- One wall-climb tick while CLIMBING: wall-jump, then directional movement in the wall plane
 -- with edge detection, then writes V's position. onUpdate only.
 function WebSlinger.UpdateClimb(dt)
   if WebSlinger.state ~= States.CLIMBING then return end
@@ -1196,12 +1229,8 @@ function WebSlinger.UpdateClimb(dt)
 
   if c.jumpQueued then
     c.jumpQueued = false
-    exitClimb("climb-jump", {
-      x = n.x * cfg.jumpOutSpeed,
-      y = n.y * cfg.jumpOutSpeed,
-      z = cfg.jumpUpSpeed,
-    })
-    return
+    -- A jump blocked by the wall-jump cooldown leaves V on the wall.
+    if WebSlinger.WallJump() then return end
   end
 
   -- Wall-plane axes: up is world up; right is to V's right while she faces into the wall.
@@ -1260,6 +1289,116 @@ local function observeClimbInput()
       if ok and kind == "BUTTON_PRESSED" then c.jumpQueued = true end
     end
   end)
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Wall-jump (C2WS-T11)
+--
+-- Jump while CLIMBING or WALLRUNNING leaves that state and launches V with
+-- wallNormal * OutwardForce + (0, 0, UpwardForce) (plus the run's along-wall speed when jumping off
+-- a wall-run), flown by the web-sling momentum carry so every jump is the same deterministic arc.
+-- While that flight lasts, a probe along V's horizontal velocity (ExecuteSmartRaycast, C2WS-T4)
+-- catches the next wall she flies into and latches her onto it (CLIMBING). If that wall roughly
+-- faces the one she jumped off, a jump within ChainWindow of the landing is a chain: the Cooldown
+-- that otherwise spaces wall-jumps out never blocks it. See docs/DESIGN.md.
+-- ---------------------------------------------------------------------------------------------
+
+--- Wall-jumps off the current wall. Only acts while CLIMBING or WALLRUNNING. Returns true if V
+-- jumped; false (V stays on the wall) when blocked by the cooldown or there is no wall to jump off.
+function WebSlinger.WallJump()
+  local state = WebSlinger.state
+  if state ~= States.CLIMBING and state ~= States.WALLRUNNING then return false end
+  local wj, cfg, s = WebSlinger.wj, WebSlinger.walljump, WebSlinger.swing
+  local player = Game.GetPlayer()
+  if player == nil then return false end
+
+  local n, pos, bx, by
+  if state == States.CLIMBING then
+    local c = WebSlinger.climbing
+    if c.pos == nil or c.normal == nil then return false end
+    n, pos, bx, by = c.normal, c.pos, 0.0, 0.0
+  else
+    local r = WebSlinger.run
+    if r.normal == nil or r.dir == nil then return false end
+    n = r.normal
+    pos = (r.teleportMode and r.pos) or player:GetWorldPosition()
+    bx, by = r.dir.x * r.speed * cfg.RunCarry, r.dir.y * r.speed * cfg.RunCarry
+  end
+
+  local now = wj.clock
+  local chain = wj.landedFacing and wj.landedAt ~= nil and (now - wj.landedAt) <= cfg.ChainWindow
+  if not chain and wj.lastJumpAt ~= nil and (now - wj.lastJumpAt) < cfg.Cooldown then
+    wj.lastResult = string.format("blocked by cooldown (%.2f s since last jump)", now - wj.lastJumpAt)
+    return false
+  end
+
+  local vel = { x = bx + n.x * cfg.OutwardForce, y = by + n.y * cfg.OutwardForce, z = cfg.UpwardForce }
+  local launchNormal = Vector4.new(n.x, n.y, 0.0, 0.0)
+  local from = state == States.CLIMBING and "climb" or "wall-run"
+  if state == States.CLIMBING then
+    exitClimb("wall-jump", vel)
+  else
+    endWallRun("wall-jump", false)
+    s.pos = vec4(pos.x, pos.y, pos.z)
+    s.vel = { x = vel.x, y = vel.y, z = vel.z }
+    s.estVel = { x = vel.x, y = vel.y, z = vel.z }
+    s.carry, s.carryTime = true, 0.0
+  end
+
+  wj.chainCount = chain and wj.chainCount + 1 or 0
+  wj.jumpCount = wj.jumpCount + 1
+  wj.lastJumpAt = now
+  wj.landedAt, wj.landedFacing = nil, false
+  wj.flying, wj.flightTime = true, 0.0
+  wj.launchNormal, wj.launchZ = launchNormal, pos.z
+  wj.lastResult = string.format("#%d off %s%s", wj.jumpCount, from,
+    chain and string.format(" (chain x%d)", wj.chainCount) or "")
+  print("[WebSlinger] wall-jump " .. wj.lastResult)
+  return true
+end
+
+--- One wall-jump tick (onUpdate, before the web-sling tick so the catch probe runs before the
+-- carry's collision would slide V along the wall): advances the wall-jump clock and, during a
+-- wall-jump flight, catches the next wall V flies into and latches her onto it.
+local function updateWallJump(dt)
+  local wj, cfg, s = WebSlinger.wj, WebSlinger.walljump, WebSlinger.swing
+  wj.clock = wj.clock + dt
+  if not wj.flying then return end
+  if WebSlinger.state ~= States.NONE or not s.carry or s.pos == nil or s.vel == nil then
+    -- Landed on the ground, re-slung, carry timed out, or something else took over.
+    wj.flying = false
+    return
+  end
+
+  wj.flightTime = wj.flightTime + dt
+  if wj.flightTime < cfg.MinFlightTime then return end
+  local v = s.vel
+  local dir = flatUnit(v)
+  if dir == nil then return end
+  local speed2D = math.sqrt(v.x * v.x + v.y * v.y)
+
+  local origin = vec4(s.pos.x, s.pos.y, s.pos.z + cfg.probeHeight)
+  local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(origin, dir, cfg.CatchDistance + speed2D * dt)
+  if not hit then return end
+  local n2 = math.sqrt(hitNormal.x * hitNormal.x + hitNormal.y * hitNormal.y)
+  if n2 < cfg.minWallNormal2D then return end
+  local n = Vector4.new(hitNormal.x / n2, hitNormal.y / n2, 0.0, 0.0)
+  if dir.x * n.x + dir.y * n.y > -cfg.MinApproachDot then return end  -- grazing, not flying into it
+
+  local ln = wj.launchNormal
+  local facing = ln ~= nil and (n.x * ln.x + n.y * ln.y) <= -cfg.FacingDot
+  wj.flying = false
+  s.carry = false
+  WebSlinger.TriggerWallLatch(n, hitPos, { x = v.x, y = v.y, z = v.z })
+  if WebSlinger.state == States.CLIMBING then
+    wj.landedAt, wj.landedFacing = wj.clock, facing
+    wj.lastLanding = string.format("%s wall after %.2f s, %+.1f m vs launch%s",
+      facing and "facing" or "other", wj.flightTime, s.pos.z - wj.launchZ,
+      facing and string.format(" (chain window %.2f s)", cfg.ChainWindow) or "")
+  else
+    wj.lastLanding = "caught a wall but the latch failed"
+  end
+  print("[WebSlinger] wall-jump landing: " .. wj.lastLanding)
 end
 
 -- Runs the forward wall probe from V's chest along her horizontal facing. Called once per
@@ -1460,15 +1599,16 @@ registerForEvent("onUpdate", function(deltaTime)
     WebSlinger.run.jumpQueued = false
     WebSlinger.swing.carry = false
     WebSlinger.swing.lastPos = nil
+    WebSlinger.wj.flying, WebSlinger.wj.landedAt, WebSlinger.wj.landedFacing = false, nil, false
     return
   end
 
   -- Clamp the step so a hitch (menu, loading) can't fling V across the map in one tick.
   local dt = math.min(deltaTime, 0.05)
+  updateWallJump(dt)
   updateSling(dt)
   WebSlinger.UpdateClimb(dt)
   updateWallRun(dt)
-  -- TODO: wall-jump mechanics go here.
 end)
 
 registerForEvent("onDraw", function()
@@ -1544,8 +1684,6 @@ registerForEvent("onDraw", function()
   ImGui.Text("Last climb exit: " .. tostring(c.lastExit))
   cc.speedUp = ImGui.SliderFloat("Climb speed up", cc.speedUp, 0.5, 10.0)
   cc.speedStrafe = ImGui.SliderFloat("Climb strafe speed", cc.speedStrafe, 0.5, 10.0)
-  cc.jumpOutSpeed = ImGui.SliderFloat("Climb-jump out", cc.jumpOutSpeed, 0.0, 15.0)
-  cc.jumpUpSpeed = ImGui.SliderFloat("Climb-jump up", cc.jumpUpSpeed, 0.0, 15.0)
   cfg.AnchorMaxDistance = ImGui.SliderFloat("Anchor max distance", cfg.AnchorMaxDistance, 10.0, 100.0)
   cfg.reelSpeed = ImGui.SliderFloat("Reel speed", cfg.reelSpeed, 0.0, 15.0)
   cfg.gravity = ImGui.SliderFloat("Swing gravity", cfg.gravity, 5.0, 30.0)
@@ -1570,6 +1708,20 @@ registerForEvent("onDraw", function()
   wr.WallRunMaxDuration = ImGui.SliderFloat("Wall-run max duration", wr.WallRunMaxDuration, 0.5, 10.0)
   wr.BrakeDecel = ImGui.SliderFloat("Wall-run brake decel", wr.BrakeDecel, 0.0, 40.0)
   wr.ManualTriggerDistance = ImGui.SliderFloat("Wall-run jump reach", wr.ManualTriggerDistance, 0.5, 4.0)
+
+  ImGui.Separator()
+  local wj, wjc = WebSlinger.wj, WebSlinger.walljump
+  ImGui.Text("Wall-jump: press jump while climbing or wall-running")
+  ImGui.Text(string.format("Flying: %s   Chain: x%d   Jumps: %d", tostring(wj.flying), wj.chainCount, wj.jumpCount))
+  if wj.landedAt ~= nil and wj.landedFacing then
+    ImGui.Text(string.format("Chain window: %.2f s left", math.max(0.0, wjc.ChainWindow - (wj.clock - wj.landedAt))))
+  end
+  ImGui.Text("Last wall-jump: " .. tostring(wj.lastResult))
+  ImGui.Text("Last wall-jump landing: " .. tostring(wj.lastLanding))
+  wjc.OutwardForce = ImGui.SliderFloat("Wall-jump outward force", wjc.OutwardForce, 0.0, 15.0)
+  wjc.UpwardForce = ImGui.SliderFloat("Wall-jump upward force", wjc.UpwardForce, 0.0, 15.0)
+  wjc.ChainWindow = ImGui.SliderFloat("Wall-jump chain window", wjc.ChainWindow, 0.1, 2.0)
+  wjc.Cooldown = ImGui.SliderFloat("Wall-jump cooldown", wjc.Cooldown, 0.0, 2.0)
 
   ImGui.Separator()
   if ImGui.Button("Send Peter Parker intro text") then

@@ -20,7 +20,7 @@ onto Cyberpunk 2077's V and Mantis Blades instead of web-shooters.
 ### Wall jump
 - Trigger: jump input while wall-climbing or wall-running.
 - Effect: impulse away from the wall normal plus upward boost; chainable between two walls
-  (classic corridor wall-jump) if timed within a short window.
+  (classic corridor wall-jump) if timed within a short window. Implemented in C2WS-T11 (see below).
 
 ### Web-sling
 - Trigger: aimed input at a valid anchor point (building edge, structure) within range and line
@@ -207,10 +207,11 @@ strafes along the wall's tangent (`speedStrafe`, 3 m/s). Before moving:
 
 ### Climb-jump
 
-Jump while `CLIMBING` exits to `NONE` and hands V to the web-sling momentum carry with velocity
-`wallNormal * jumpOutSpeed (6) + up * jumpUpSpeed (7)`, so she arcs off the wall under the mod's
-gravity and then falls normally. From `NONE` she can fire a new web-sling or (C2WS-T11) latch onto
-the next wall.
+Jump while `CLIMBING` is the wall-jump (C2WS-T11, below): it exits to `NONE` and hands V to the
+web-sling momentum carry with velocity `wallNormal * OutwardForce (6) + up * UpwardForce (7)`, so
+she arcs off the wall under the mod's gravity. From `NONE` she can fire a new web-sling, or the
+wall-jump flight latches her onto the next wall she flies into. (The old climb-only
+`climb.jumpOutSpeed` / `jumpUpSpeed` tunables were folded into `WebSlinger.walljump`.)
 
 ### Verification status
 
@@ -311,7 +312,7 @@ CameraTiltTime)` (10 degrees, 0.3 s) on entry, signed by which side the wall is 
 `SetCameraTilt(0, CameraTiltTime)` on exit; also `pcall`-guarded since the API is unverified, and the
 sign convention needs checking in-game.
 
-Jump while already wall-running is ignored here; the wall jump is C2WS-T10. All tunables live in
+Jump while already wall-running is the wall-jump (C2WS-T11, below). All tunables live in
 `WebSlinger.wallrun` and the main ones have debug-panel sliders.
 
 Not yet verified in-game (the implementing agent could not run the game). Outstanding checks:
@@ -319,6 +320,40 @@ Not yet verified in-game (the implementing agent could not run the game). Outsta
 sliding off or clipping in; (2) approach a wall on foot and mid-air, look/move toward it to one
 side, press jump, and confirm the same run starts; (3) whether `SetLinearVelocity` and
 `SetCameraTilt` exist (watch the CET console for the "driving V by teleport" line).
+
+## Wall-jump (C2WS-T11)
+
+`WebSlinger.WallJump()` runs on the game's own Jump action (same `PlayerPuppet:OnAction` observers
+as the climb and the manual wall-run trigger) while `CLIMBING` or `WALLRUNNING`. It exits that
+state and launches V with `wallNormal * OutwardForce + Vector4(0, 0, UpwardForce, 0)` (6 and 7 m/s);
+off a wall-run the run's along-wall speed (`dir * speed * RunCarry`, `RunCarry` 1.0) is added, so
+the jump keeps the run's momentum. The flight is the web-sling momentum carry (teleport-driven,
+the mod's swing gravity), so every jump from a standstill on a wall flies the same arc.
+
+**Landing on the next wall.** While the flight lasts (`wj.flying`, until V lands on the ground,
+re-slings, or the carry times out), `updateWallJump` runs before the web-sling tick and casts
+`ExecuteSmartRaycast` (C2WS-T4) from chest height along V's horizontal velocity, `CatchDistance`
+(0.9 m) plus this tick's travel. A wall-like hit she is flying into (`dir . n <= -MinApproachDot`,
+0.3; not in the first `MinFlightTime`, 0.08 s, so the launch wall is never re-caught) latches her
+onto it (`TriggerWallLatch` -> `CLIMBING`, which zeroes her velocity).
+
+**Chain.** If that wall roughly faces the one she jumped off (`nLand . nLaunch <= -FacingDot`,
+0.5), the landing opens a `ChainWindow` (0.6 s). A wall-jump inside the window is a chain: it is
+never blocked by the `Cooldown` (0.35 s minimum between wall-jumps, which otherwise stops a
+double-tap or a too-quick re-jump in a narrow gap). Outside the window it is just a normal
+wall-jump. Times run on `wj.clock`, accumulated enabled `onUpdate` time, so pausing doesn't eat the
+window. Because each landing zeroes velocity and each jump applies the same impulse, alternating
+between two facing walls clears comparable height and distance every jump.
+
+The debug panel shows flying state, chain count, the remaining chain window, the last jump and
+landing (including height gained versus launch), with sliders for `OutwardForce`, `UpwardForce`,
+`ChainWindow` and `Cooldown`; all tunables live in `WebSlinger.walljump`.
+
+Not yet verified in-game (the implementing agent could not run the game). Outstanding check from
+the ticket: in a corridor with two facing walls, alternate wall-jumping between them at least 3
+times without touching the ground ("chain xN" in the CET console / panel), each jump clearing
+comparable height and distance to the first. Also confirm jumping off a wall-run launches out and
+forward, not back into the wall.
 
 ## Implementation approach (open question)
 
