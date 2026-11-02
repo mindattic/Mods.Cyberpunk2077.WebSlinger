@@ -98,6 +98,12 @@ local WebSlinger = {
     GroundClearance = 1.0,      -- metres the arc's low point (V's feet) is kept above the ground
     SkimShortenRate = 12.0,     -- m/s the rope may shorten to keep that clearance
     SkimMinSpeed = 6.0,         -- along-ground speed (m/s) below which a ground touch still lands
+    -- Timed swing boost (C2WS-T35, Spider-Man 2): a jump tap with V's hand within BoostWindowDeg of
+    -- straight below the anchor lets go with extra forward speed; anywhere else it is a plain release.
+    BoostWindowDeg = 30.0,      -- tap counts as "at the bottom" within this angle of straight down
+    BoostSpeed = 8.0,           -- horizontal speed (m/s) added on a boosted release (clamped to maxSpeed)
+    BoostLift = 5.0,            -- vertical speed floor (m/s) on a boosted release, so the exit clears the ground
+    BoostSteerBlend = 0.5,      -- exit heading: 0 = swing's own horizontal direction, 1 = look heading
     steerAccel = 6.0,           -- tangential push toward the camera's heading while swinging
     anchorReachDistance = 2.5,  -- reaching this close to the anchor ends the swing
     maxSwingTime = 8.0,         -- safety cap on a single swing
@@ -123,6 +129,10 @@ local WebSlinger = {
     lastShotPath = "none",      -- "aimed", "assist" or "miss": which FindAnchor path the last tap took (C2WS-T34)
     attachCount = 0,
     tapReleaseCount = 0,  -- swings let go with a jump tap (C2WS-T30), for the panel
+    boostCount = 0,       -- tap releases inside the bottom window that got the boost (C2WS-T35)
+    lastTapAngle = nil,   -- last tap release: hand angle from straight below the anchor (deg)
+    lastTapSpeedBefore = nil, -- ... and V's speed (m/s) just before and just after it
+    lastTapSpeedAfter = nil,
     -- Ground skim (C2WS-T33), for the panel.
     skimLowZ = nil,       -- predicted feet height at the bottom of the current arc (world z)
     skimGroundZ = nil,    -- ground height under V from the downward probe (nil = nothing in reach)
@@ -1610,9 +1620,71 @@ function WebSlinger.TryJumpSling()
   return true
 end
 
+--- Jump tap while SLINGING (C2WS-T30 release + C2WS-T35 timed boost). Always lets go of the web with
+-- momentum carry. If V's hand point is within sling.BoostWindowDeg of straight below the anchor, the
+-- release is boosted first (Spider-Man 2's swing jump); anywhere else s.vel is left exactly as is,
+-- which is C2WS-T30's plain release. Returns true if the release was boosted.
+--
+-- Angle from bottom (same measure as C2WS-T23's TryBoostLeap, world z up): h = hand - anchor with
+-- hand = feet + handHeight, and straight below the anchor is (0, 0, -1), so
+-- cos(angle) = h . (0, 0, -1) / |h| = -h.z / |h|.
+--
+-- Boost vector: let vh = (v.x, v.y) with length hs. The exit heading d is vh / hs (or the look
+-- heading if V has under 0.5 m/s horizontally) blended toward the flat look heading L by
+-- BoostSteerBlend b: d = normalize((1 - b) * vh / hs + b * L), falling back to L if those cancel.
+-- Vertical speed becomes vz = max(v.z, BoostLift). Horizontal speed becomes
+-- H = min(hs + BoostSpeed, sqrt(maxSpeed^2 - vz^2)), never below hs, so the whole exit vector stays
+-- within maxSpeed without trading horizontal speed for the lift. New velocity = (d.x H, d.y H, vz),
+-- then clampSpeed as a final guard. E.g. bottom of the arc at 20 m/s horizontal, v.z ~ 0: exit is
+-- 28 m/s horizontal + 5 m/s up (|v| ~ 28.4 m/s), under the 40 m/s cap.
+function WebSlinger.TapReleaseSling()
+  local s, cfg = WebSlinger.swing, WebSlinger.sling
+  s.tapReleaseCount = s.tapReleaseCount + 1
+  local a, v = s.anchor, s.vel
+  local player = Game.GetPlayer()
+  local angle = nil
+  if a ~= nil and s.pos ~= nil and v ~= nil then
+    local hx, hy, hz = s.pos.x - a.x, s.pos.y - a.y, (s.pos.z + cfg.handHeight) - a.z
+    local hlen = math.sqrt(hx * hx + hy * hy + hz * hz)
+    if hlen > 1e-4 then
+      angle = math.deg(math.acos(math.max(-1.0, math.min(1.0, -hz / hlen))))
+    end
+  end
+  local before = (v ~= nil) and swingSpeed(v) or 0.0
+  s.lastTapAngle, s.lastTapSpeedBefore, s.lastTapSpeedAfter = angle, before, before
+
+  if angle == nil or player == nil or angle > (cfg.BoostWindowDeg or 0.0) then
+    releaseSling(angle ~= nil and string.format("tap released (%.0f deg from bottom, %.1f m/s)", angle, before)
+      or "tap released", true)
+    return false
+  end
+
+  local lx, ly = aimHeading(player, false)
+  local hs = math.sqrt(v.x * v.x + v.y * v.y)
+  local sx, sy = lx, ly
+  if hs > 0.5 then sx, sy = v.x / hs, v.y / hs end
+  local b = math.max(0.0, math.min(1.0, cfg.BoostSteerBlend or 0.0))
+  local dx, dy = (1.0 - b) * sx + b * lx, (1.0 - b) * sy + b * ly
+  local dlen = math.sqrt(dx * dx + dy * dy)
+  if dlen > 1e-3 then dx, dy = dx / dlen, dy / dlen else dx, dy = lx, ly end
+
+  local vz = math.max(v.z, cfg.BoostLift or 0.0)
+  local hmax = math.sqrt(math.max(0.0, cfg.maxSpeed * cfg.maxSpeed - vz * vz))
+  local h = math.max(hs, math.min(hs + (cfg.BoostSpeed or 0.0), hmax))
+  s.vel = { x = dx * h, y = dy * h, z = vz }
+  clampSpeed(s.vel, cfg.maxSpeed)
+  s.estVel = { x = s.vel.x, y = s.vel.y, z = s.vel.z }
+  s.boostCount = s.boostCount + 1
+  s.lastTapSpeedAfter = swingSpeed(s.vel)
+  releaseSling(string.format("tap boosted (%.0f deg from bottom, %.1f -> %.1f m/s)",
+    angle, before, s.lastTapSpeedAfter), true)
+  return true
+end
+
 -- One wall-run tick: consumes a queued jump press and runs the wall-run physics. onUpdate only.
 -- The queued jump tap is the single trigger for every jump action: WALLRUNNING wall-jumps;
--- SLINGING always lets go of the web with momentum carry, anywhere in the arc (C2WS-T30); NONE
+-- SLINGING always lets go of the web with momentum carry, anywhere in the arc (C2WS-T30), boosted
+-- forward if the tap lands near the bottom of the arc (C2WS-T35); NONE
 -- tries the side wall-run probe first, the head-on latch probe only if it found nothing, and, if V
 -- is airborne, shoots a web at the crosshair only if neither found a wall, so one tap triggers at
 -- most one.
@@ -1624,10 +1696,8 @@ local function updateWallRun(dt)
     if jump and WebSlinger.WallJump() then return end
     WebSlinger.UpdateWallHangPhysics(dt)
   elseif jump and WebSlinger.state == States.SLINGING then
-    local s = WebSlinger.swing
-    s.tapReleaseCount = s.tapReleaseCount + 1
-    releaseSling("tap released", true)
-    print("[WebSlinger] jump dispatch: SLINGING, tap released the web")
+    WebSlinger.TapReleaseSling()
+    print("[WebSlinger] jump dispatch: SLINGING, " .. tostring(WebSlinger.swing.lastRelease))
   elseif jump and WebSlinger.state == States.NONE then
     print("[WebSlinger] jump dispatch: NONE, trying wall-run then wall-latch then jump-sling")
     if not WebSlinger.TryManualWallRun() and not WebSlinger.TryManualWallLatch()
@@ -2559,6 +2629,13 @@ registerForEvent("onDraw", function()
     end
   end
   ImGui.Text(string.format("Skims (rope shortened): %d   Ground slides: %d", s.skimCount, s.groundSlideCount))
+  if s.lastTapAngle ~= nil then
+    ImGui.Text(string.format("Boosts: %d   Last tap: %.0f deg from bottom, %.1f -> %.1f m/s (%+.1f)",
+      s.boostCount, s.lastTapAngle, s.lastTapSpeedBefore, s.lastTapSpeedAfter,
+      s.lastTapSpeedAfter - s.lastTapSpeedBefore))
+  else
+    ImGui.Text(string.format("Boosts: %d   Last tap: (none yet)", s.boostCount))
+  end
   ImGui.Text("Last shot: " .. tostring(s.lastSearch))
   ImGui.Text("Last release: " .. tostring(s.lastRelease or "(none yet)"))
   ImGui.Text("Last wall impact: " .. tostring(WebSlinger.wall.lastImpact))
@@ -2585,6 +2662,10 @@ registerForEvent("onDraw", function()
   cfg.GroundClearance = ImGui.SliderFloat("Ground clearance", cfg.GroundClearance, 0.0, 5.0)
   cfg.SkimShortenRate = ImGui.SliderFloat("Skim shorten rate", cfg.SkimShortenRate, 1.0, 40.0)
   cfg.SkimMinSpeed = ImGui.SliderFloat("Skim min speed", cfg.SkimMinSpeed, 0.0, 20.0)
+  cfg.BoostWindowDeg = ImGui.SliderFloat("Boost window (deg)", cfg.BoostWindowDeg, 0.0, 90.0)
+  cfg.BoostSpeed = ImGui.SliderFloat("Boost speed", cfg.BoostSpeed, 0.0, 20.0)
+  cfg.BoostLift = ImGui.SliderFloat("Boost lift", cfg.BoostLift, 0.0, 15.0)
+  cfg.BoostSteerBlend = ImGui.SliderFloat("Boost steer blend", cfg.BoostSteerBlend, 0.0, 1.0)
   cfg.damping = ImGui.SliderFloat("Damping (per s)", cfg.damping, 0.0, 0.5)
   cfg.dampingFloorSpeed = ImGui.SliderFloat("Damping floor speed", cfg.dampingFloorSpeed, 0.0, 60.0)
   cfg.gravity = ImGui.SliderFloat("Swing gravity", cfg.gravity, 5.0, 30.0)

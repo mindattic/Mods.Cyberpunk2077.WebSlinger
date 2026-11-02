@@ -70,15 +70,33 @@ consumes it and does exactly one thing per tap:
 
 | State when jump is tapped | Result |
 |---|---|
-| `SLINGING` | `releaseSling("tap released", true)`: let go with full momentum carry, anywhere in the arc |
+| `SLINGING` | `TapReleaseSling()`: let go with full momentum carry anywhere in the arc; within `BoostWindowDeg` of the bottom the release is boosted first (C2WS-T35) |
 | `NONE`, airborne | `TryManualWallRun()` (side wall), else `TryManualWallLatch()` (head-on, C2WS-T21), else `TryJumpSling()`: shoot a web at the crosshair |
 | `NONE`, grounded | the wall-run / wall-latch probes as before, otherwise the plain game jump (no web) |
 | `WALLRUNNING` | wall-jump (C2WS-T11), unchanged |
 
 Wall-run and wall-latch keep priority over the web exactly as before C2WS-T30: a web only fires
-when neither wall probe found a qualifying wall. A tap while `SLINGING` never does anything but a
-plain release: no angle check and no special case anywhere in the arc (the C2WS-T23 boost leap and
-the held-bind chain release are both removed, see below).
+when neither wall probe found a qualifying wall. A tap while `SLINGING` always lets go; the
+C2WS-T23 boost leap and the held-bind chain release are removed (see below), but C2WS-T35 brings a
+timed boost back into the tap-only model.
+
+### Timed swing boost (C2WS-T35, Spider-Man 2 swing jump)
+
+`TapReleaseSling` measures V's hand point's angle from straight below the anchor (C2WS-T23's
+measure, world z up): with `h = hand - anchor` and `hand = feet + handHeight`,
+`cos(angle) = h . (0, 0, -1) / |h| = -h.z / |h|`. Above `BoostWindowDeg` (30 deg, slider) the tap is
+exactly C2WS-T30's plain release (velocity untouched). Inside it, before releasing with carry:
+
+- heading `d = normalize((1 - b) * vh / |vh| + b * L)`, where `vh` is the swing velocity's horizontal
+  part, `L` the flat look heading and `b = BoostSteerBlend` (0.5); `L` stands in when `|vh| < 0.5`
+  or the two cancel;
+- vertical `vz = max(v.z, BoostLift)` (5 m/s), so the exit clears the ground;
+- horizontal `H = min(|vh| + BoostSpeed, sqrt(maxSpeed^2 - vz^2))`, never below `|vh|`
+  (`BoostSpeed` 8 m/s), so the exit stays within `maxSpeed` without trading speed for lift;
+- `v = (d.x H, d.y H, vz)`, then the usual momentum carry.
+
+E.g. 20 m/s horizontal at the bottom with `v.z ~ 0` exits at 28 m/s forward and 5 m/s up. The panel
+shows the boost count and the last tap's angle and speed change.
 
 ### Direct-aim anchor: the crosshair is the anchor (C2WS-T30)
 
