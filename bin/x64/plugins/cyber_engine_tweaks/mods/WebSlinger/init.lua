@@ -78,6 +78,11 @@ local WebSlinger = {
     maxSpeed = 40.0,            -- velocity clamp while swinging/carrying
     chainMinSwingTime = 0.45,   -- with the key held, auto-release only after this long on the rope
     chainReleaseAngleDeg = 35.0,-- ... and once V has swung this far past the bottom, rising
+    -- Boost leap (C2WS-T23): jump near the bottom of the arc lets go toward the look heading.
+    leapBottomWindowDeg = 25.0, -- jump counts as "at the bottom" within this angle of straight down
+    leapBoostSpeed = 24.0,      -- horizontal launch speed floor along the look heading
+    leapSpeedBonus = 6.0,       -- ... or current swing speed plus this, whichever is faster
+    leapLift = 6.0,             -- vertical speed floor (m/s) at launch, so the leap clears the arc
     retryInterval = 0.15,       -- with the key held and no rope, re-search this often
     launchSpeed = 5.0,          -- upward hop (m/s) when firing from the ground
     carryMaxTime = 4.0,         -- momentum carry after release hands back to native physics after this
@@ -89,6 +94,7 @@ local WebSlinger = {
     keyWasHeld = false,   -- keyHeld as of the previous tick, for edge detection
     auto = false,         -- current swing was auto-fired by a mid-air jump, not the held bind (C2WS-T22)
     autoCount = 0,        -- swings auto-fired by a mid-air jump, for the panel
+    leapCount = 0,        -- bottom-of-swing boost leaps (C2WS-T23), for the panel
     anchor = nil,        -- Vector4 world anchor point while attached
     anchorNormal = nil,   -- surface normal at the anchor
     ropeLength = 0.0,
@@ -461,7 +467,11 @@ end
 -- the velocity component driving into it.
 local function moveWithCollision(s, nx, ny, nz)
   local from = vec4(s.pos.x, s.pos.y, s.pos.z + 0.9)
-  local dx, dy, dz = nx - from.x, ny - from.y, nz - from.z
+  -- Direction matches V's real per-tick displacement (origin only is raised to chest height);
+  -- deriving it from the raised origin toward the unraised target skewed the probe steeply
+  -- downward on near-flat ticks, which could false-trigger a "landed" hit on sloped ground
+  -- well below an actual mid-swing V.
+  local dx, dy, dz = nx - s.pos.x, ny - s.pos.y, nz - s.pos.z
   local len = math.sqrt(dx * dx + dy * dy + dz * dz)
   if len > 1e-3 then
     local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(from, Vector4.new(dx, dy, dz, 0.0), len + 0.1)
@@ -957,7 +967,11 @@ function WebSlinger.InitiateWallRun(wallNormal, currentVelocity, hitPos, manual)
   end
 
   r.normal, r.dir = n, wallParallelDir
-  local entrySpeed = math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z)
+  -- Lateral (2D) speed only: UpdateWallHangPhysics's ongoing check compares against
+  -- measuredSpeed, which is horizontal-only, so entry speed must use the same measure or a
+  -- fall with real vertical speed but little horizontal speed would qualify here and then
+  -- immediately read as "too slow" once the grace period ends.
+  local entrySpeed = math.sqrt(vel.x * vel.x + vel.y * vel.y)
   if manual then
     -- Manual trigger: no swing speed to preserve, so give the run its minimum speed.
     r.speed = math.max(entrySpeed, cfg.MinWallRunSpeed)
@@ -1154,7 +1168,7 @@ end
 local function observeWallRunJump()
   Observe("PlayerPuppet", "OnAction", function(_, action)
     -- NONE: manual wall-run trigger. WALLRUNNING: wall-jump off the run (C2WS-T11).
-    -- SLINGING: lets go of a jump-fired swing (C2WS-T22).
+    -- SLINGING: boost leap near the arc bottom (C2WS-T23), else lets go of a jump-fired swing (C2WS-T22).
     if WebSlinger.state ~= States.NONE and WebSlinger.state ~= States.WALLRUNNING
       and WebSlinger.state ~= States.SLINGING then return end
     local ok, isJump = pcall(function()
@@ -1187,6 +1201,37 @@ function WebSlinger.TryJumpSling()
   return true
 end
 
+--- Bottom-of-swing boost leap (C2WS-T23): called when jump is pressed while SLINGING. If V's hand
+-- point is within sling.leapBottomWindowDeg of straight below the anchor (the same angle-from-bottom
+-- measure the chain release uses), overwrites the swing velocity with a boosted launch along her
+-- look heading and lets go with momentum carry. The horizontal speed is the faster of
+-- leapBoostSpeed and current swing speed + leapSpeedBonus (clamped to maxSpeed); vertical speed is
+-- raised to at least leapLift. Outside the window nothing changes and it returns false.
+function WebSlinger.TryBoostLeap()
+  if WebSlinger.state ~= States.SLINGING then return false end
+  local s, cfg = WebSlinger.swing, WebSlinger.sling
+  local player = Game.GetPlayer()
+  local a, v = s.anchor, s.vel
+  if player == nil or a == nil or s.pos == nil or v == nil then return false end
+
+  local hx, hy, hz = s.pos.x - a.x, s.pos.y - a.y, (s.pos.z + cfg.handHeight) - a.z
+  local hlen = math.sqrt(hx * hx + hy * hy + hz * hz)
+  if hlen < 1e-4 then return false end
+  local angleFromBottom = math.deg(math.acos(math.max(-1.0, math.min(1.0, -hz / hlen))))
+  if angleFromBottom > cfg.leapBottomWindowDeg then return false end
+
+  local dx, dy = aimHeading(player, false)
+  local before = swingSpeed(v)
+  local speed = math.min(cfg.maxSpeed, math.max(cfg.leapBoostSpeed, before + cfg.leapSpeedBonus))
+  s.vel = { x = dx * speed, y = dy * speed, z = math.max(v.z, cfg.leapLift) }
+  clampSpeed(s.vel, cfg.maxSpeed)
+  s.leapCount = s.leapCount + 1
+  releaseSling(string.format("boost leap (%.0f deg from bottom, %.1f -> %.1f m/s)",
+    angleFromBottom, before, swingSpeed(s.vel)), true)
+  print("[WebSlinger] " .. s.lastRelease)
+  return true
+end
+
 -- One wall-run tick: consumes a queued jump press (manual trigger from NONE, wall-jump while
 -- running) and runs the wall-run physics. onUpdate only. From NONE the side wall-run probe runs
 -- first, the head-on latch probe only if it found nothing, and, if V is airborne, the jump-fired
@@ -1199,9 +1244,12 @@ local function updateWallRun(dt)
     if jump and WebSlinger.WallJump() then return end
     WebSlinger.UpdateWallHangPhysics(dt)
   elseif jump and WebSlinger.state == States.SLINGING then
-    -- A jump during a jump-fired swing lets go with momentum carry (C2WS-T22). A swing held on the
-    -- dedicated bind ignores jump, as before.
-    if WebSlinger.swing.auto then releaseSling("jump released auto-sling", true) end
+    -- Near the bottom of the arc, any swing's jump is a boost leap toward the look heading
+    -- (C2WS-T23). Elsewhere, a jump during a jump-fired swing lets go with momentum carry
+    -- (C2WS-T22) and a swing held on the dedicated bind ignores jump, as before.
+    if not WebSlinger.TryBoostLeap() and WebSlinger.swing.auto then
+      releaseSling("jump released auto-sling", true)
+    end
   elseif jump and WebSlinger.state == States.NONE then
     if not WebSlinger.TryManualWallRun() and not WebSlinger.TryManualWallLatch() then
       WebSlinger.TryJumpSling()
@@ -1230,7 +1278,11 @@ function WebSlinger.CheckWallCollisionDuringSwing()
   local wallNormal2D = Vector4.new(hitNormal.x / n2, hitNormal.y / n2, 0.0, 0.0)
 
   local impactAngle = movementDir.x * wallNormal2D.x + movementDir.y * wallNormal2D.y
-  local currentSpeed = swingSpeed(v)
+  -- Lateral (2D) speed, matching the documented "minimum lateral speed" trigger and the
+  -- horizontal-only measuredSpeed check wall-run uses once it's running (C2WS-T9/T10): a 3D
+  -- magnitude here let a steep vertical fall alone satisfy the threshold, then immediately
+  -- fail the horizontal-only ongoing check a fraction of a second into the run.
+  local currentSpeed = speed2D
   local velocity = { x = v.x, y = v.y, z = v.z }
 
   local branch
@@ -1378,8 +1430,9 @@ local function setClimbInvulnerable(player, on)
   if ok then
     c.invulnerable = on
   else
+    -- Leave c.invulnerable unchanged on failure: claiming success here would make the guard
+    -- above short-circuit every later retry, stranding the engine's god-mode flag on forever.
     print("[WebSlinger] climb: god-mode toggle failed (" .. (on and "add" or "remove") .. ")")
-    if not on then c.invulnerable = false end
   end
 end
 
@@ -1487,7 +1540,10 @@ StateHooks[States.CLIMBING].onExit = function()
   if player ~= nil then
     setClimbInvulnerable(player, false)
   else
-    c.invulnerable = false
+    -- No player reference to call RemoveGodMode on: leave c.invulnerable as it was (true) so a
+    -- later successful setClimbInvulnerable(player, false) still runs instead of being skipped
+    -- by the already-off guard, which would otherwise strand the engine's flag on forever.
+    print("[WebSlinger] climb: god-mode toggle skipped on exit (no player reference)")
   end
 end
 
@@ -1958,8 +2014,8 @@ registerForEvent("onDraw", function()
   ImGui.Text("Web-sling: bind the key under CET Bindings > WebSlinger")
   ImGui.Text(string.format("Key: %s   Grappling: %s   Carry: %s   Attaches: %d",
     s.keyHeld and "HELD" or "up", tostring(WebSlinger.IsGrappling), tostring(s.carry), s.attachCount))
-  ImGui.Text(string.format("Jump-sling: %s   Jump-fired swings: %d",
-    s.auto and "ACTIVE" or "off", s.autoCount))
+  ImGui.Text(string.format("Jump-sling: %s   Jump-fired swings: %d   Boost leaps: %d",
+    s.auto and "ACTIVE" or "off", s.autoCount, s.leapCount))
   if WebSlinger.IsGrappling and s.vel ~= nil then
     ImGui.Text(string.format("Rope: %.1f m   Speed: %.1f m/s   Time: %.2f s",
       s.ropeLength, swingSpeed(s.vel), s.time))

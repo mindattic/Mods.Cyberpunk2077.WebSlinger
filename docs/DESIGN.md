@@ -152,6 +152,32 @@ Not yet verified in-game; outstanding check from the ticket: from a standstill w
 equipped, look toward a tall building, jump, jump again before landing, and confirm V attaches and
 swings in the looked-at direction with no swing bind held.
 
+### Bottom-of-swing boost leap (C2WS-T23)
+
+A jump press while `SLINGING`, with V near the bottom of the arc, lets go with a deliberate burst
+of speed toward where she is looking instead of the pendulum's own exit velocity. The press goes
+through the same queued jump as the other jump consumers; `updateWallRun`'s `SLINGING` branch
+calls `TryBoostLeap()` first. "Near the bottom" is a band, not an instant: the angle from straight
+down (anchor to V's hand point, the same `angleFromBottom` the chain release uses) is at most
+`leapBottomWindowDeg` (25 deg) on either side of the lowest point. It applies to both held-bind and
+jump-fired swings. Outside the window the press does exactly what it did before: a jump-fired swing
+lets go with its raw velocity (C2WS-T22), a held swing ignores it.
+
+**Decision: hard overwrite of direction, blended magnitude.** The launch direction is always the
+flat look heading (`aimHeading(player, false)`, as swing steering uses), so where the web is
+anchored no longer decides where V goes. The horizontal speed is the faster of `leapBoostSpeed`
+(24 m/s) and the current swing speed plus `leapSpeedBonus` (6 m/s), clamped to `maxSpeed`: a slow
+swing still gets a clear jump in speed, and a fast one is never slowed by leaping. Vertical speed is
+raised to at least `leapLift` (6 m/s) so the leap clears the bottom of the arc instead of skimming
+the ground. The new velocity is written to `swing.vel` before `releaseSling("boost leap ...",
+true)`, so the leap enters the ordinary momentum carry: wall-impact routing (C2WS-T7/T9),
+wall-jump flight catch (C2WS-T11) and re-sling (C2WS-T12) see the boosted velocity like any other
+release. The panel counts boost leaps and "Last release" shows the angle and the speed change.
+
+Not yet verified in-game; outstanding check from the ticket: mid-swing, jump at the bottom of the
+arc while looking away from the swing's travel direction, and confirm V launches toward where she
+is looking with a noticeable speed increase.
+
 ### Verification status
 
 Not yet verified in-game; the agent that implemented this could not run the game. Outstanding
