@@ -77,13 +77,20 @@ local WebSlinger = {
     assistMinTravelSpeed = 3.0,  -- horizontal m/s below which the look heading stands in for travel
     eyeHeight = 1.7,            -- aim ray starts this far above V's feet (first-person camera estimate)
     handHeight = 1.5,           -- rope attaches to V this far above her feet
-    -- Propel-then-elastic attach (C2WS-T30): yank toward the anchor, then the pendulum takes over.
-    AttachPropelSpeed = 18.0,   -- speed (m/s) toward the anchor V is guaranteed on attach
-    PropelDuration = 0.35,      -- seconds the rope shortens to follow her in before the swing settles
+    -- Propel-then-elastic attach (C2WS-T30): a quick tug toward the anchor, then the pendulum takes
+    -- over at a fixed rope length (C2WS-T32; see docs/DESIGN.md for the take-up math).
+    AttachPropelSpeed = 12.0,   -- speed (m/s) toward the anchor V is guaranteed on attach
+    PropelDuration = 0.25,      -- seconds the rope shortens to follow her in before the swing settles
+    PropelMinRopeFraction = 0.75, -- the tug never takes the rope below this fraction of its start length
     gravity = 9.81 * 1.6,       -- swing gravity; a bit heavier than real for a snappier arc
-    damping = 0.02,             -- fraction of velocity bled per second while swinging
-    reelSpeed = 4.0,            -- rope shortens this fast, pulling V toward the anchor
-    minRopeLength = 6.0,        -- reel never shortens the rope below this
+    damping = 0.02,             -- fraction of velocity bled per second, only above dampingFloorSpeed
+    dampingFloorSpeed = 30.0,   -- damping is a brake near maxSpeed: it never bleeds speed below this
+    reelSpeed = 0.0,            -- continuous reel-in after the propel (0 = fixed-length pendulum, C2WS-T32)
+    minRopeLength = 6.0,        -- neither the propel nor the reel shortens the rope below this
+    -- Speed through the bottom (C2WS-T32): a small tangential push along V's swing direction while
+    -- the rope is within BottomPumpWindowDeg of straight down, strongest at the very bottom.
+    BottomPumpAccel = 2.5,      -- m/s^2 at the bottom of the arc, fading linearly to 0 at the window edge
+    BottomPumpWindowDeg = 30.0, -- half-width of the bottom window (rope angle from vertical)
     steerAccel = 6.0,           -- tangential push toward the camera's heading while swinging
     anchorReachDistance = 2.5,  -- reaching this close to the anchor ends the swing
     maxSwingTime = 8.0,         -- safety cap on a single swing
@@ -390,6 +397,17 @@ local function clampSpeed(v, maxSpeed)
   end
 end
 
+-- Damping as a safety brake only (C2WS-T32): bleeds cfg.damping of the speed per second, but never
+-- takes V below cfg.dampingFloorSpeed, so a swing at cruising speed is never slowed by it.
+local function applyDamping(v, cfg, dt)
+  local speed = swingSpeed(v)
+  local floor = cfg.dampingFloorSpeed or 0.0
+  if speed <= floor or speed < 1e-4 then return end
+  local target = math.max(floor, speed * math.max(0.0, 1.0 - cfg.damping * dt))
+  local k = target / speed
+  v.x, v.y, v.z = v.x * k, v.y * k, v.z * k
+end
+
 -- Writes V's position. Keeps her current yaw so mouse look is never fought.
 local function placeV(player, p)
   local facility = Game.GetTeleportationFacility()
@@ -605,14 +623,16 @@ local function releaseSling(reason, carry)
   WebSlinger.SetState(States.NONE)
 end
 
---- Advances the swing by deltaTime seconds: gravity, steering, damping, reel-in, the rope
--- constraint (pendulum), collision, then writes V's position. Runs every onUpdate tick while
--- WebSlinger.IsGrappling. During the attach propel phase (C2WS-T30, swing.propelling) the rope also
--- shortens to follow V in as she is yanked toward the anchor, so it never goes slack; the phase ends
--- after sling.PropelDuration or once the rope is down to minRopeLength, whichever comes first, and
--- the leftover inward speed is dropped there (the web "catches") so the elastic pendulum starts on a
--- taut rope. Ends the swing (SetState NONE) on reaching the anchor, landing, or the safety time cap;
--- letting go otherwise is only ever a jump tap (see updateWallRun).
+--- Advances the swing by deltaTime seconds: gravity, steering, the bottom-of-arc pump, damping
+-- (brake only), the optional reel-in, the rope constraint (pendulum), collision, then writes V's
+-- position. Runs every onUpdate tick while WebSlinger.IsGrappling. During the attach propel phase
+-- (C2WS-T30, swing.propelling) the rope also shortens to follow V in as she is tugged toward the
+-- anchor, so it never goes slack; the phase ends after sling.PropelDuration or once the rope is down
+-- to max(minRopeLength, PropelMinRopeFraction x its start length), whichever comes first, and the
+-- leftover inward speed is dropped there (the web "catches") so the pendulum starts on a taut rope,
+-- never slower than V attached (C2WS-T32). After that the rope keeps its length (reelSpeed 0) and
+-- the pendulum keeps its speed: see docs/DESIGN.md. Ends the swing (SetState NONE) on reaching the
+-- anchor, landing, or the safety time cap; letting go otherwise is only ever a jump tap.
 function WebSlinger.UpdateGrapplePhysics(deltaTime)
   local s, cfg = WebSlinger.swing, WebSlinger.sling
   local player = Game.GetPlayer()
@@ -632,23 +652,58 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
   -- ever swings V around the anchor and never stretches or slackens the rope by itself.
   local rx, ry, rz = a.x - s.pos.x, a.y - s.pos.y, a.z - (s.pos.z + hand)
   local rlen = math.sqrt(rx * rx + ry * ry + rz * rz)
+  local ux, uy, uz = 0.0, 0.0, 1.0
   if rlen > 1e-4 then
-    local ux, uy, uz = rx / rlen, ry / rlen, rz / rlen
+    ux, uy, uz = rx / rlen, ry / rlen, rz / rlen
     local hx, hy = aimHeading(player, false)
     local along = hx * ux + hy * uy
     local tx, ty, tz = hx - along * ux, hy - along * uy, -along * uz
     v.x = v.x + tx * cfg.steerAccel * dt
     v.y = v.y + ty * cfg.steerAccel * dt
     v.z = v.z + tz * cfg.steerAccel * dt
+
+    -- Bottom pump (C2WS-T32): within BottomPumpWindowDeg of the bottom of the arc (u = hand ->
+    -- anchor, so uz = cos(rope angle from vertical) with the anchor overhead), push V along her own
+    -- tangential velocity, fading linearly from BottomPumpAccel at the very bottom to 0 at the
+    -- window edge. Tangential only, so it never stretches or slackens the rope.
+    local window = cfg.BottomPumpWindowDeg or 0.0
+    if not s.propelling and (cfg.BottomPumpAccel or 0.0) > 0.0 and window > 0.0 and uz > 0.0 then
+      local angle = math.deg(math.acos(math.min(1.0, uz)))
+      if angle < window then
+        local radial = v.x * ux + v.y * uy + v.z * uz
+        local px, py, pz = v.x - radial * ux, v.y - radial * uy, v.z - radial * uz
+        local plen = math.sqrt(px * px + py * py + pz * pz)
+        if plen > 1.0 then
+          local push = cfg.BottomPumpAccel * (1.0 - angle / window) * dt / plen
+          v.x, v.y, v.z = v.x + px * push, v.y + py * push, v.z + pz * push
+        end
+      end
+    end
   end
 
-  local keep = math.max(0.0, 1.0 - cfg.damping * dt)
-  v.x, v.y, v.z = v.x * keep, v.y * keep, v.z * keep
+  applyDamping(v, cfg, dt)
   clampSpeed(v, cfg.maxSpeed)
 
-  -- Reel in: shortening the rope is what pulls V toward the anchor, along the arc. Never lengthens
-  -- a rope that started shorter than minRopeLength (a close aimed anchor).
-  if s.ropeLength > cfg.minRopeLength then
+  -- Speed the swing should keep through this tick's rope projection (C2WS-T32): on a taut rope,
+  -- V's speed with only the outward radial part removed at the current position. The projection
+  -- below drops the radial part at the new position as well, which also removes the ~|v|^2 dt / L
+  -- the velocity picks up just from the rope direction turning during the step, an O(dt) energy
+  -- leak (about 1-5 %/s at cruising speed on a 10-20 m rope); restoring this speed afterwards
+  -- cancels that leak while gravity's along-the-arc work stays in.
+  local keepSpeed = nil
+  if not s.propelling and rlen > 1e-4 and rlen >= s.ropeLength - 0.05 then
+    local outward = -(v.x * ux + v.y * uy + v.z * uz)
+    if outward > 0.0 then
+      local tx, ty, tz = v.x + outward * ux, v.y + outward * uy, v.z + outward * uz
+      keepSpeed = math.sqrt(tx * tx + ty * ty + tz * tz)
+    else
+      keepSpeed = swingSpeed(v)
+    end
+  end
+
+  -- Optional reel-in (reelSpeed, 0 by default since C2WS-T32: the swing is a fixed-length
+  -- pendulum). Never lengthens a rope that started shorter than minRopeLength.
+  if cfg.reelSpeed > 0.0 and s.ropeLength > cfg.minRopeLength then
     s.ropeLength = math.max(cfg.minRopeLength, s.ropeLength - cfg.reelSpeed * dt)
   end
 
@@ -665,6 +720,13 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
     if radial > 0.0 then
       v.x, v.y, v.z = v.x - radial * ex, v.y - radial * ey, v.z - radial * ez
     end
+    if keepSpeed ~= nil then
+      local now = swingSpeed(v)
+      if now > 1e-4 and now < keepSpeed then
+        local k = keepSpeed / now
+        v.x, v.y, v.z = v.x * k, v.y * k, v.z * k
+      end
+    end
     dist = s.ropeLength
   end
 
@@ -672,7 +734,8 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
     -- Propel phase (C2WS-T30): the attach impulse carries V inward (dist < ropeLength), so take up
     -- the slack. ox/oy/oz point from the anchor out to her hand at the new position.
     if dist < s.ropeLength then s.ropeLength = math.max(dist, 1e-3) end
-    if s.time >= cfg.PropelDuration or s.ropeLength <= cfg.minRopeLength then
+    local propelFloor = math.max(cfg.minRopeLength, s.propelMinRope or 0.0)
+    if s.time >= cfg.PropelDuration or s.ropeLength <= propelFloor then
       s.propelling = false
       -- Recompute the length: if the constraint above projected V, ox/oy/oz are pre-projection
       -- (same direction, longer than dist).
@@ -683,6 +746,27 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
         if radial < 0.0 then
           -- Still moving inward: the web catches here, so drop that and keep the tangential part.
           v.x, v.y, v.z = v.x - radial * ex, v.y - radial * ey, v.z - radial * ez
+        end
+        -- Momentum floor (C2WS-T32): the swing never starts slower than V attached, so a re-sling
+        -- keeps the carried speed (the tug's own inward speed is spent taking up the rope, not
+        -- added on top). Too little tangential motion to scale: lay the missing speed along the
+        -- camera heading's tangent instead.
+        local want = math.min(s.attachSpeed or 0.0, cfg.maxSpeed)
+        local now = swingSpeed(v)
+        if now < want then
+          if now > 0.5 then
+            local k = want / now
+            v.x, v.y, v.z = v.x * k, v.y * k, v.z * k
+          else
+            local hx, hy = aimHeading(player, false)
+            local along = hx * ex + hy * ey
+            local tx, ty, tz = hx - along * ex, hy - along * ey, -along * ez
+            local tlen = math.sqrt(tx * tx + ty * ty + tz * tz)
+            if tlen > 1e-4 then
+              local add = (want - now) / tlen
+              v.x, v.y, v.z = v.x + tx * add, v.y + ty * add, v.z + tz * add
+            end
+          end
         end
       end
     end
@@ -725,6 +809,8 @@ local function tryAttach(player)
     s.vel.z = cfg.launchSpeed
   end
   s.carry = false
+  -- Speed V attached with (carry velocity on a re-sling): the swing never starts slower (C2WS-T32).
+  s.attachSpeed = swingSpeed(s.vel)
   s.anchor, s.anchorNormal = anchor, normal
   -- d = anchor - hand (world space, metres): points from V's hand to the anchor.
   local dx, dy, dz = anchor.x - pos.x, anchor.y - pos.y, anchor.z - (pos.z + cfg.handHeight)
@@ -742,6 +828,7 @@ local function tryAttach(player)
     end
     clampSpeed(s.vel, cfg.maxSpeed)
   end
+  s.propelMinRope = s.ropeLength * (cfg.PropelMinRopeFraction or 0.0)
   s.propelling = cfg.PropelDuration > 0.0
   s.time = 0.0
   s.attachCount = s.attachCount + 1
@@ -757,8 +844,7 @@ local function carryTick(player, dt)
   s.carryTime = s.carryTime + dt
   local v = s.vel
   v.z = v.z - cfg.gravity * dt
-  local keep = math.max(0.0, 1.0 - cfg.damping * dt)
-  v.x, v.y, v.z = v.x * keep, v.y * keep, v.z * keep
+  applyDamping(v, cfg, dt)
   clampSpeed(v, cfg.maxSpeed)
 
   local landed = moveWithCollision(s, s.pos.x + v.x * dt, s.pos.y + v.y * dt, s.pos.z + v.z * dt)
@@ -2413,7 +2499,12 @@ registerForEvent("onDraw", function()
   cfg.aimToleranceDeg = ImGui.SliderFloat("Aim tolerance (deg)", cfg.aimToleranceDeg, 0.0, 5.0)
   cfg.AttachPropelSpeed = ImGui.SliderFloat("Attach propel speed", cfg.AttachPropelSpeed, 0.0, 35.0)
   cfg.PropelDuration = ImGui.SliderFloat("Propel duration", cfg.PropelDuration, 0.0, 1.0)
+  cfg.PropelMinRopeFraction = ImGui.SliderFloat("Propel min rope fraction", cfg.PropelMinRopeFraction, 0.3, 1.0)
   cfg.reelSpeed = ImGui.SliderFloat("Reel speed", cfg.reelSpeed, 0.0, 15.0)
+  cfg.BottomPumpAccel = ImGui.SliderFloat("Bottom pump accel", cfg.BottomPumpAccel, 0.0, 10.0)
+  cfg.BottomPumpWindowDeg = ImGui.SliderFloat("Bottom pump window (deg)", cfg.BottomPumpWindowDeg, 0.0, 60.0)
+  cfg.damping = ImGui.SliderFloat("Damping (per s)", cfg.damping, 0.0, 0.5)
+  cfg.dampingFloorSpeed = ImGui.SliderFloat("Damping floor speed", cfg.dampingFloorSpeed, 0.0, 60.0)
   cfg.gravity = ImGui.SliderFloat("Swing gravity", cfg.gravity, 5.0, 30.0)
   cfg.steerAccel = ImGui.SliderFloat("Steer accel", cfg.steerAccel, 0.0, 20.0)
   -- Swing cable look (C2WS-T25).

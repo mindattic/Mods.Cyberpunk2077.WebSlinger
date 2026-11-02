@@ -127,7 +127,7 @@ On a successful attach (`tryAttach`), the rope length is the hand-to-anchor dist
 is seeded with V's current velocity, as before. Then V gets the **propel impulse**: with
 `u = (anchor - hand) / |anchor - hand|` (hand = feet + `handHeight`, world space, pointing from V
 to the anchor), her velocity component along `u` is topped up to at least `sling.AttachPropelSpeed`
-(18 m/s, slider): `v += u * max(0, AttachPropelSpeed - v.u)`. Her sideways momentum is kept, speed
+(12 m/s since C2WS-T32, slider): `v += u * max(0, AttachPropelSpeed - v.u)`. Her sideways momentum is kept, speed
 she already had toward the anchor beyond that is kept, and speed away from the anchor is cancelled
 by the same top-up. The result is speed-clamped to `maxSpeed`.
 
@@ -138,16 +138,39 @@ closer to the anchor than the rope length, the rope length becomes that distance
 goes slack while she is yanked inward. **Decision: a short timed phase, not "until the rope takes
 hold".** With an inward impulse the rope never goes taut on its own, so "wait for the constraint"
 would let V fly slack all the way to the anchor and end the swing on `anchorReachDistance`. The
-phase ends after `sling.PropelDuration` (0.35 s, slider) or once the rope is down to
-`minRopeLength` (6 m), whichever comes first. At that moment the leftover inward radial speed is
-dropped (the web "catches") and the tangential part is kept, so the existing elastic pendulum takes
-over on a taut rope from wherever the yank brought her, carrying her sideways speed. At the default
-18 m/s for 0.35 s the yank covers roughly 6 m before the swing settles.
+phase ends after `sling.PropelDuration` (0.25 s since C2WS-T32, slider) or once the rope is down to
+`max(minRopeLength, PropelMinRopeFraction x start length)` (6 m / 0.75, sliders), whichever comes
+first. At that moment the leftover inward radial speed is dropped (the web "catches") and the
+tangential part is kept, so the pendulum takes over on a taut rope from wherever the tug brought
+her, carrying her sideways speed. **Momentum floor (C2WS-T32):** if the swing would then be slower
+than the speed V attached with (`swing.attachSpeed`, her seed velocity before the tug), it is scaled
+back up to that speed (with almost no tangential motion to scale, the missing speed is laid along the
+camera heading's tangent). The tug's own inward speed is spent taking up the rope, not added on top,
+and a re-sling never starts slower than the carry it was fired from.
 
-Tuning: raise `AttachPropelSpeed` for a harder yank, lengthen `PropelDuration` for a longer pull
+Tuning: raise `AttachPropelSpeed` for a harder tug, lengthen `PropelDuration` for a longer pull
 (shorter swing radius); `PropelDuration` 0 keeps the impulse but skips the rope-follow phase, so V
-flies in slack until gravity and the rope catch her at the original length. Reel-in now never
+flies in slack until gravity and the rope catch her at the original length. Reel-in never
 lengthens a rope that started shorter than `minRopeLength` (a close aimed anchor).
+
+#### Propel take-up: a tug, not a pull to the wall (C2WS-T32)
+
+C2WS-T30 shipped 18 m/s for 0.35 s plus a continuous 4 m/s reel-in for the whole swing: about 6 m
+of rope went in the yank and the reel then dragged V the rest of the way, so a long swing drifted
+into `anchorReachDistance` (2.5 m) and ended as a grapple. Now the tug is 12 m/s for 0.25 s, and
+the rope length is fixed after it.
+
+Rope taken up during the tug, with inward speed `v0`, swing gravity `g` = 1.6 x 9.81 = 15.7 m/s^2
+and anchor elevation `theta` above V's hand (gravity's component along `u` is `-g sin(theta)`):
+`d = v0 T - 1/2 g sin(theta) T^2`. At `v0` = 12 m/s, `T` = 0.25 s that is 3.0 m for a level anchor,
+2.65 m at 45 deg and 2.6 m at 60 deg. So a 20 m anchor leaves about 17 m of rope and a 35 m anchor
+about 32 m: the swing radius is close to the aimed distance, which is what makes it read as a swing.
+If V was already carrying more speed toward the anchor than the tug (the top-up keeps it), the take-up
+grows with it (30 m/s inward would be 7.5 m), so `PropelMinRopeFraction` (0.75) caps it at a quarter
+of the rope: never shorter than 15 m on a 20 m anchor or 26 m on a 35 m one. With `reelSpeed` 0
+the rope then keeps that length, and V can only get closer to the anchor than the rope by flying
+slack toward it, which needs inward speed the catch has just removed: no typical 20-35 m swing ends
+on `anchorReachDistance` any more (it stays as a safety stop for slack flights past a close anchor).
 
 ### Swing physics: `UpdateGrapplePhysics(deltaTime)`
 
@@ -160,15 +183,48 @@ while grappling (`deltaTime` clamped to 50 ms):
 1. Gravity (`sling.gravity`, 1.6 g by default for a snappier arc).
 2. Steering: a small push along the camera heading with its rope-parallel component removed, so
    it only swings V around the anchor.
-3. Light damping and a speed clamp.
-4. Reel-in: the rope shortens at `reelSpeed` down to `minRopeLength`. This is what pulls V toward
-   the anchor, and it does so along the arc. During the propel phase the rope also shortens to
-   follow V in (above).
-5. Rope constraint: if the hand point ends up beyond rope length it is put back on the sphere
+3. Bottom pump (C2WS-T32): while the rope is within `BottomPumpWindowDeg` (30 deg, slider) of
+   straight down, a push along V's own tangential velocity of `BottomPumpAccel` (2.5 m/s^2, slider)
+   at the very bottom, fading linearly to 0 at the window edge. Not during the propel phase.
+4. Damping as a brake only and a speed clamp: `damping` (0.02/s, slider) bleeds speed only above
+   `dampingFloorSpeed` (30 m/s, slider), and never below it, so cruising swings are never slowed by
+   it; `maxSpeed` (40 m/s) still clamps. The post-release carry uses the same brake.
+5. Reel-in: off by default since C2WS-T32 (`reelSpeed` 0, slider kept for experiments). The swing
+   is a fixed-length pendulum after the propel phase; during that phase the rope shortens to follow
+   V in (above).
+6. Rope constraint: if the hand point ends up beyond rope length it is put back on the sphere
    around the anchor and the outward radial velocity is removed. That is the pendulum: gravity
-   plus a taut rope gives an arc, never a straight pull to the point.
-6. Collision via `ExecuteSmartRaycast` along the step: a walkable surface (normal z > 0.6) lands V;
+   plus a taut rope gives an arc, never a straight pull to the point. When the rope was already
+   taut, the speed V had with only the outward radial part removed at the start of the step is
+   restored after the projection (C2WS-T32, below).
+7. Collision via `ExecuteSmartRaycast` along the step: a walkable surface (normal z > 0.6) lands V;
    a wall slides her along it.
+
+#### Pendulum energy: keeping speed through the bottom (C2WS-T32)
+
+An ideal pendulum conserves `1/2 v^2 + g h`, so V leaves the bottom at the same height with the same
+speed she entered at. Three things in the old step broke that, each now handled:
+
+- **Damping** at 0.02/s cost about 2 %/s, about 0.5 m/s per 25 m/s swing second. It now only acts
+  above `dampingFloorSpeed` (30 m/s), as a brake near `maxSpeed`.
+- **Projection leak.** The step moves V along her velocity, then projects her back onto the rope
+  sphere and drops the outward radial velocity there. Over one step the rope direction turns by
+  `|v| dt / L`, so the dropped part includes `|v| sin(|v| dt / L)` of perfectly good tangential
+  speed: a per-tick factor `cos(|v| dt / L) ~ 1 - |v|^2 dt^2 / 2 L^2`, that is a loss rate of
+  `|v|^2 dt / 2 L^2` per second. At 25 m/s and 60 fps that is 1.8 %/s on a 17 m rope and 5 %/s on
+  10 m: a numerical brake bigger than the damping was. The fix records, when the rope is taut at the
+  start of the step, V's speed with only the outward radial part removed (so gravity's along-the-arc
+  work is counted and its into-the-rope part is not) and scales her back up to it after the
+  projection. Semi-implicit Euler on the tangential motion is then energy-stable to first order.
+- **Reel-in** shortened the rope while she swung (above): gone.
+
+On top of that, the **bottom pump** gives a small, tunable gain per pass. Over the window
+(arc length `L w` either side of the bottom, `w` = window in radians) the push averages
+`BottomPumpAccel / 2`, so one full pass adds `delta(1/2 v^2) = BottomPumpAccel x L x w`. At the
+defaults on a 17 m rope that is 2.5 x 17 x 0.52 = 22 m^2/s^2: a swing entering the bottom at
+20 m/s comes out at 21.1 m/s, at 25 m/s it comes out at 25.9 m/s. Steering (`steerAccel`) adds or
+removes energy depending on where the camera points; the damping brake above 30 m/s and the 40 m/s
+clamp keep a long chain from running away.
 
 ### Release and momentum
 
@@ -181,6 +237,11 @@ over. The release speed is never zeroed.
 
 Chaining is the player's own rhythm now: tap to let go wherever in the arc feels right, then tap
 again mid-air to shoot the next web at wherever the crosshair is, seeded with the carried velocity.
+Verified in code (C2WS-T32): a tap release leaves `swing.carry` set with `swing.vel` = the release
+velocity; `carryTick` integrates that same table; the next tap's `tryAttach` seeds from `swing.vel`
+while `carry` is set (not the native-physics `estVel`), and after a carry timeout `estVel` is the
+carry's last velocity anyway because `carryTick` writes it every tick. The momentum floor at the end
+of the propel phase then keeps the new swing at least that fast.
 
 **Removed in C2WS-T30.** C2WS-T6's held-bind auto chain release (`chainMinSwingTime`,
 `chainReleaseAngleDeg`: let go automatically on the upswing while the bind stayed held, then
