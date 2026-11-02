@@ -1922,15 +1922,96 @@ local function drawRaycastOverlay()
   end
 end
 
--- The visible cable while swinging: a line from V's hand to the anchor.
+-- Projects a world point that is known to be in front of the camera. Unlike worldToScreen it keeps
+-- points far off-screen (ImGui clips the line to the display), so a long cable whose anchor sits
+-- above the top edge of the view still draws its visible part instead of vanishing entirely.
+local function projectInFront(point)
+  local camera = Game.GetCameraSystem()
+  if camera == nil then return nil end
+  local ndc = camera:ProjectPoint(point)
+  if ndc == nil or math.abs(ndc.x) > 100.0 or math.abs(ndc.y) > 100.0 then return nil end
+  local width, height = GetDisplayResolution()
+  return (ndc.x + 1.0) * 0.5 * width, (1.0 - ndc.y) * 0.5 * height
+end
+
+-- Camera position estimate and unit axes (forward, right, up) for the cable, or nil.
+local function ropeCamera(s, rc)
+  local ok, fwd = pcall(function() return Game.GetCameraSystem():GetActiveCameraForward() end)
+  if not ok or fwd == nil then return nil end
+  local flen = math.sqrt(fwd.x * fwd.x + fwd.y * fwd.y + fwd.z * fwd.z)
+  if flen < 1e-4 then return nil end
+  local f = { x = fwd.x / flen, y = fwd.y / flen, z = fwd.z / flen }
+  -- Right = forward x world up (flat); up = right x forward.
+  local rx, ry = f.y, -f.x
+  local rlen = math.sqrt(rx * rx + ry * ry)
+  if rlen < 1e-4 then rx, ry = 1.0, 0.0 else rx, ry = rx / rlen, ry / rlen end
+  return {
+    pos = { x = s.pos.x, y = s.pos.y, z = s.pos.z + rc.cameraHeight },
+    f = f,
+    r = { x = rx, y = ry, z = 0.0 },
+    u = { x = ry * f.z, y = -rx * f.z, z = rx * f.y - ry * f.x },
+  }
+end
+
+-- Default cable start: just ahead of the camera, lower right, where V's right hand shows.
+local function ropeCameraHandPoint(cam, rc)
+  local c, f, r, u = cam.pos, cam.f, cam.r, cam.u
+  return vec4(c.x + f.x * rc.handForward + r.x * rc.handRight - u.x * rc.handDown,
+    c.y + f.y * rc.handForward + r.y * rc.handRight - u.y * rc.handDown,
+    c.z + f.z * rc.handForward + r.z * rc.handRight - u.z * rc.handDown)
+end
+
+-- The visible cable while swinging (C2WS-T25): from V's hand to the anchor, rebuilt every frame
+-- from the live swing state so both ends track the arc, and gone the frame IsGrappling drops. The
+-- segment is clipped against the camera's near plane in world space first: the old version dropped
+-- the whole line whenever either end was off screen or behind the camera, which is most of a swing
+-- (the anchor sits high above the view and V's body-centre hand point is under the camera).
 local function drawRope()
   local s = WebSlinger.swing
   if not WebSlinger.IsGrappling or s.anchor == nil or s.pos == nil then return end
+  local rc = WebSlinger.rope
+  local cam = ropeCamera(s, rc)
+  if cam == nil then return end
+  local hand = ropeCameraHandPoint(cam, rc)
+  if WebSlinger.monowire.HandAnchor then
+    -- V's right-hand slot (C2WS-T26) when one resolved; its body-centre estimate sits under the
+    -- first-person camera, so without a slot the camera-relative start above is the better hand.
+    local slotHand = monowireHandPoint()
+    if WebSlinger.monowire.component ~= nil then hand = slotHand end
+  end
+
+  -- Near-plane clip: depth along the camera forward, keep only the part in front of nearClip.
+  local c, f = cam.pos, cam.f
+  local hx, hy, hz = hand.x, hand.y, hand.z
+  local ax, ay, az = s.anchor.x, s.anchor.y, s.anchor.z
+  local dh = (hx - c.x) * f.x + (hy - c.y) * f.y + (hz - c.z) * f.z
+  local da = (ax - c.x) * f.x + (ay - c.y) * f.y + (az - c.z) * f.z
+  if dh < rc.nearClip and da < rc.nearClip then return end
+  if dh < rc.nearClip then
+    local t = (rc.nearClip - dh) / (da - dh)
+    hx, hy, hz = hx + (ax - hx) * t, hy + (ay - hy) * t, hz + (az - hz) * t
+  elseif da < rc.nearClip then
+    local t = (rc.nearClip - da) / (dh - da)
+    ax, ay, az = ax + (hx - ax) * t, ay + (hy - ay) * t, az + (hz - az) * t
+  end
+
+  local sx, sy = projectInFront(vec4(hx, hy, hz))
+  local ex, ey = projectInFront(vec4(ax, ay, az))
+  if sx == nil or ex == nil then return end
+
   local drawList = ImGui.GetBackgroundDrawList()
-  local white = ImGui.GetColorU32(0.95, 0.95, 0.95, 0.9)
-  local hand = monowireHandPoint()  -- V's right-hand slot, else an estimate (C2WS-T26)
-  drawWorldLine(drawList, hand, s.anchor, white, 2.0)
-  drawWorldPoint(drawList, s.anchor, white, 4.0)
+  local col = rc.color
+  local glow = ImGui.GetColorU32(col[1], col[2], col[3], col[4] * rc.glowAlpha)
+  local core = ImGui.GetColorU32(col[1], col[2], col[3], col[4])
+  -- Pale filament down the middle so it reads as a taut lit cable rather than a flat stroke.
+  local hot = ImGui.GetColorU32(0.6 + 0.4 * col[1], 0.6 + 0.4 * col[2], 0.6 + 0.4 * col[3], col[4])
+  ImGui.ImDrawListAddLine(drawList, sx, sy, ex, ey, glow, rc.thickness * rc.glowScale)
+  ImGui.ImDrawListAddLine(drawList, sx, sy, ex, ey, core, rc.thickness)
+  ImGui.ImDrawListAddLine(drawList, sx, sy, ex, ey, hot, math.max(1.0, rc.thickness * 0.35))
+  if da >= rc.nearClip then
+    drawWorldPoint(drawList, s.anchor, glow, rc.anchorRadius * 2.0)
+    drawWorldPoint(drawList, s.anchor, core, rc.anchorRadius)
+  end
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -2150,6 +2231,16 @@ registerForEvent("onDraw", function()
   cfg.reelSpeed = ImGui.SliderFloat("Reel speed", cfg.reelSpeed, 0.0, 15.0)
   cfg.gravity = ImGui.SliderFloat("Swing gravity", cfg.gravity, 5.0, 30.0)
   cfg.steerAccel = ImGui.SliderFloat("Steer accel", cfg.steerAccel, 0.0, 20.0)
+  -- Swing cable look (C2WS-T25).
+  local rc = WebSlinger.rope
+  rc.thickness = ImGui.SliderFloat("Cable thickness", rc.thickness, 1.0, 12.0)
+  local newColor, colorUsed = ImGui.ColorEdit4("Cable color", rc.color)
+  if colorUsed and type(newColor) == "table" and #newColor >= 4 then rc.color = newColor end
+  rc.glowScale = ImGui.SliderFloat("Cable glow width", rc.glowScale, 1.0, 6.0)
+  rc.glowAlpha = ImGui.SliderFloat("Cable glow opacity", rc.glowAlpha, 0.0, 1.0)
+  rc.handForward = ImGui.SliderFloat("Cable start ahead", rc.handForward, 0.2, 2.0)
+  rc.handRight = ImGui.SliderFloat("Cable start right", rc.handRight, -1.0, 1.0)
+  rc.handDown = ImGui.SliderFloat("Cable start down", rc.handDown, -0.5, 1.0)
 
   ImGui.Separator()
   local r, wr = WebSlinger.run, WebSlinger.wallrun
