@@ -245,6 +245,36 @@ and the head-on probe only `> WallLatchAngleThreshold`, so a wall near the bound
 swing into it would. Not yet verified in-game: from a standing or running start with no cyberware
 equipped and no swing active, face a wall head-on, press jump, and confirm V enters `CLIMBING`.
 
+**C2WS-T27 (instrumented, unconfirmed):** Ryan reported this did not work at all in-game. A static
+read of the whole jump-dispatch chain (`observeWallRunJump` -> `updateWallRun` ->
+`TryManualWallRun` -> `TryManualWallLatch` -> `TryJumpSling`) found no logic bug:
+
+- The ticket's lead suspect -- `TryManualWallRun`'s forward-diagonal probe directions
+  (`Vector4.new(rx + hx, ry + hy, ...)` etc.) not being unit length -- turns out not to matter:
+  `ExecuteSmartRaycast` calls `normalized(direction)` on whatever it is given before casting, so
+  those probes reach exactly `ManualTriggerDistance`, neither further nor shorter.
+- For a flat wall straight ahead, every probe direction that reaches it (the two forward-diagonal
+  ones; the pure side probes run parallel to such a wall and should not hit it) sees the same wall
+  normal, so `TryManualWallRun`'s `abs(heading . normal) <= min(ManualMaxFacingDot,
+  WallLatchAngleThreshold)` (0.75) correctly rejects a true head-on hit (`abs(...) ~= 1`) and leaves
+  it for `TryManualWallLatch`, whose own `> WallLatchAngleThreshold` then correctly accepts it. The
+  two thresholds share the same 0.75 value with no gap or overlap between them.
+- The `CLIMBING` state's own re-probe on enter reaches `WallCheckDistance + standoff +
+  stickDistance` = 2.0 + 0.45 + 1.0 = 3.45 m into the wall, comfortably past `ManualLatchDistance`
+  (1.5 m), so a latch found by `TryManualWallLatch` should not then fail that re-probe and bounce
+  back to `NONE`.
+- `observeWallRunJump` and `TriggerWallLatch` have no equipment or other hidden gate.
+
+None of this rules out a non-code cause (the mod's `enabled` checkbox not persisting across
+sessions per the README is the standing suspect, since nothing in the T21-T23 chain has been run
+in-game yet by anyone who could confirm it), nor a real-geometry case a flat test wall would not
+show (e.g. a doorframe or other non-planar hit skewing one probe's normal). Rather than guess-fix
+further without a repro, every decision point in the chain above now prints to the CET console on
+every jump press in `NONE`/`WALLRUNNING`/`SLINGING` (which branch was tried, why it was rejected,
+and the actual distance/angle/state values involved), so the next person who reproduces this with
+the console open (`~` in-game) can read off exactly where the press stops rather than re-deriving
+it from scratch. This ticket is left open pending that log.
+
 ### Entering `CLIMBING`: gravity, fall damage, residual velocity
 
 The `CLIMBING` `onEnter` hook re-probes into the wall along `-wall.normal` (or, if entered from the

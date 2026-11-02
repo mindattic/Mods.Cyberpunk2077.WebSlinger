@@ -1080,9 +1080,15 @@ end
 -- diagonal probes; a wall straight ahead does not count), starts a wall-run on the nearest one.
 -- Returns true if a run started.
 function WebSlinger.TryManualWallRun()
-  if WebSlinger.state ~= States.NONE then return false end
+  if WebSlinger.state ~= States.NONE then
+    print(string.format("[WebSlinger] wall-run: manual probe skipped (state=%s, not NONE)", WebSlinger.state))
+    return false
+  end
   local player = Game.GetPlayer()
-  if player == nil then return false end
+  if player == nil then
+    print("[WebSlinger] wall-run: manual probe skipped (no player)")
+    return false
+  end
   local cfg, s = WebSlinger.wallrun, WebSlinger.swing
 
   local pos = player:GetWorldPosition()
@@ -1100,19 +1106,33 @@ function WebSlinger.TryManualWallRun()
   -- TryManualWallLatch, so the side/head-on split matches CheckWallCollisionDuringSwing (C2WS-T21).
   local maxFacing = math.min(cfg.ManualMaxFacingDot, WebSlinger.impact.WallLatchAngleThreshold)
   local bestNormal, bestPos, bestDist = nil, nil, math.huge
-  for _, dir in ipairs(probes) do
+  local bestDot, sawAnyHit = nil, false
+  for i, dir in ipairs(probes) do
     local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(origin, dir, cfg.ManualTriggerDistance)
     if hit then
+      sawAnyHit = true
       local n = flatUnit(hitNormal)
       local n2 = math.sqrt(hitNormal.x * hitNormal.x + hitNormal.y * hitNormal.y)
-      if n ~= nil and n2 >= cfg.minWallNormal2D and math.abs(n.x * hx + n.y * hy) <= maxFacing then
+      local dot = n ~= nil and math.abs(n.x * hx + n.y * hy) or nil
+      -- C2WS-T27 diagnostic (always on; only runs on a jump press, so it never spams the log):
+      -- ExecuteSmartRaycast normalizes `dir` internally (see its own definition), so the diagonal
+      -- probes' non-unit-length Vector4s above do NOT extend or shrink the actual raycast distance
+      -- -- this print confirms that per probe in the field rather than leaving it assumed.
+      print(string.format(
+        "[WebSlinger] wall-run: probe #%d hit, n2=%.2f dot=%s (maxFacing=%.2f, minWallNormal2D=%.2f)",
+        i, n2, dot ~= nil and string.format("%.2f", dot) or "nil", maxFacing, cfg.minWallNormal2D))
+      if n ~= nil and n2 >= cfg.minWallNormal2D and dot <= maxFacing then
         local dx, dy = hitPos.x - origin.x, hitPos.y - origin.y
         local dist = dx * dx + dy * dy
-        if dist < bestDist then bestNormal, bestPos, bestDist = n, hitPos, dist end
+        if dist < bestDist then bestNormal, bestPos, bestDist, bestDot = n, hitPos, dist, dot end
       end
     end
   end
-  if bestNormal == nil then return false end
+  if bestNormal == nil then
+    print(string.format("[WebSlinger] wall-run: manual probe found no qualifying side wall (sawAnyHit=%s)",
+      tostring(sawAnyHit)))
+    return false
+  end
 
   local seed = s.carry and s.vel or s.estVel
   local velocity = { x = seed.x, y = seed.y, z = seed.z }
@@ -1129,9 +1149,15 @@ end
 -- falling all qualify: the press is the deliberate action), and no equipment check.
 -- Returns true if V latched.
 function WebSlinger.TryManualWallLatch()
-  if WebSlinger.state ~= States.NONE then return false end
+  if WebSlinger.state ~= States.NONE then
+    print(string.format("[WebSlinger] wall-latch: manual probe skipped (state=%s, not NONE)", WebSlinger.state))
+    return false
+  end
   local player = Game.GetPlayer()
-  if player == nil then return false end
+  if player == nil then
+    print("[WebSlinger] wall-latch: manual probe skipped (no player)")
+    return false
+  end
   local cfg, s = WebSlinger.wallrun, WebSlinger.swing
 
   local pos = player:GetWorldPosition()
@@ -1139,13 +1165,28 @@ function WebSlinger.TryManualWallLatch()
   local hx, hy = aimHeading(player, true)
   local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(
     origin, Vector4.new(hx, hy, 0.0, 0.0), cfg.ManualLatchDistance)
-  if not hit then return false end
+  -- C2WS-T27 diagnostic (always on; only runs on a jump press that TryManualWallRun already
+  -- declined, so it never spams the log): names exactly which guard rejected the probe and with
+  -- what value, so a live repro's CET console log pinpoints the failing check.
+  if not hit then
+    print(string.format("[WebSlinger] wall-latch: no hit within ManualLatchDistance (%.2f m, heading %.2f,%.2f)",
+      cfg.ManualLatchDistance, hx, hy))
+    return false
+  end
 
   local n = flatUnit(hitNormal)
   local n2 = math.sqrt(hitNormal.x * hitNormal.x + hitNormal.y * hitNormal.y)
-  if n == nil or n2 < cfg.minWallNormal2D then return false end  -- floor/ledge, not a wall
+  if n == nil or n2 < cfg.minWallNormal2D then  -- floor/ledge, not a wall
+    print(string.format("[WebSlinger] wall-latch: hit rejected, not a wall (n2=%.2f, minWallNormal2D=%.2f)",
+      n2, cfg.minWallNormal2D))
+    return false
+  end
   local facing = math.abs(n.x * hx + n.y * hy)
-  if facing <= WebSlinger.impact.WallLatchAngleThreshold then return false end
+  if facing <= WebSlinger.impact.WallLatchAngleThreshold then
+    print(string.format("[WebSlinger] wall-latch: hit too glancing (facing=%.2f, need > %.2f)",
+      facing, WebSlinger.impact.WallLatchAngleThreshold))
+    return false
+  end
 
   local seed = s.carry and s.vel or s.estVel
   local velocity = { x = seed.x, y = seed.y, z = seed.z }
@@ -1183,15 +1224,24 @@ end
 -- bound to jump. Registered in onInit; only queues, the onUpdate tick does the work.
 local function observeWallRunJump()
   Observe("PlayerPuppet", "OnAction", function(_, action)
-    -- NONE: manual wall-run trigger. WALLRUNNING: wall-jump off the run (C2WS-T11).
-    -- SLINGING: boost leap near the arc bottom (C2WS-T23), else lets go of a jump-fired swing (C2WS-T22).
-    if WebSlinger.state ~= States.NONE and WebSlinger.state ~= States.WALLRUNNING
-      and WebSlinger.state ~= States.SLINGING then return end
+    -- Check for a Jump press before the state gate below (not after): this action fires on every
+    -- bound input, not just Jump, and the C2WS-T27 diagnostic print only fires on a real Jump
+    -- BUTTON_PRESSED, confirming this hook sees the press at all regardless of state.
     local ok, isJump = pcall(function()
       return Game.NameToString(ListenerAction.GetName(action)) == "Jump"
         and ListenerAction.GetType(action).value == "BUTTON_PRESSED"
     end)
-    if ok and isJump then WebSlinger.run.jumpQueued = true end
+    if not ok or not isJump then return end
+
+    -- NONE: manual wall-run trigger. WALLRUNNING: wall-jump off the run (C2WS-T11).
+    -- SLINGING: boost leap near the arc bottom (C2WS-T23), else lets go of a jump-fired swing (C2WS-T22).
+    if WebSlinger.state ~= States.NONE and WebSlinger.state ~= States.WALLRUNNING
+      and WebSlinger.state ~= States.SLINGING then
+      print(string.format("[WebSlinger] jump observed but ignored (state=%s)", WebSlinger.state))
+      return
+    end
+    WebSlinger.run.jumpQueued = true
+    print(string.format("[WebSlinger] jump observed, queued (state=%s)", WebSlinger.state))
   end)
 end
 
@@ -1267,8 +1317,10 @@ local function updateWallRun(dt)
       releaseSling("jump released auto-sling", true)
     end
   elseif jump and WebSlinger.state == States.NONE then
-    if not WebSlinger.TryManualWallRun() and not WebSlinger.TryManualWallLatch() then
-      WebSlinger.TryJumpSling()
+    print("[WebSlinger] jump dispatch: NONE, trying wall-run then wall-latch then jump-sling")
+    if not WebSlinger.TryManualWallRun() and not WebSlinger.TryManualWallLatch()
+      and not WebSlinger.TryJumpSling() then
+      print("[WebSlinger] jump dispatch: all three probes declined, press falls through to the game's own jump")
     end
   end
 end
