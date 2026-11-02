@@ -119,9 +119,11 @@ local WebSlinger = {
     glowScale = 3.0,            -- soft halo drawn under the core, this many times its width
     glowAlpha = 0.25,           -- halo opacity relative to the core colour
     anchorRadius = 5.0,         -- dot at the anchor end, pixels
-    handForward = 0.6,          -- cable start: this far ahead of the camera
-    handRight = 0.25,           -- ... this far to its right
-    handDown = 0.3,             -- ... and this far below it
+    -- C2WS-T29: centred and dropped below the visible frame (reads as coming from around V's
+    -- belly/belt line) instead of hovering as a visible dot in the lower-right of view.
+    handForward = 0.5,          -- cable start: this far ahead of the camera
+    handRight = 0.0,            -- ... this far to its right (centred)
+    handDown = 1.0,             -- ... and this far below it (pushes it below the visible frame)
     cameraHeight = 1.7,         -- camera height above V's feet, for the start point and clipping
     nearClip = 0.1,             -- parts of the cable closer than this to the camera plane are cut
   },
@@ -2292,7 +2294,7 @@ registerForEvent("onDraw", function()
   rc.glowAlpha = ImGui.SliderFloat("Cable glow opacity", rc.glowAlpha, 0.0, 1.0)
   rc.handForward = ImGui.SliderFloat("Cable start ahead", rc.handForward, 0.2, 2.0)
   rc.handRight = ImGui.SliderFloat("Cable start right", rc.handRight, -1.0, 1.0)
-  rc.handDown = ImGui.SliderFloat("Cable start down", rc.handDown, -0.5, 1.0)
+  rc.handDown = ImGui.SliderFloat("Cable start down", rc.handDown, -0.5, 2.0)  -- C2WS-T29: widened
 
   ImGui.Separator()
   local r, wr = WebSlinger.run, WebSlinger.wallrun
