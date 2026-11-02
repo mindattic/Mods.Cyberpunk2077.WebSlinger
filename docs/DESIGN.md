@@ -97,9 +97,29 @@ when the centre ray misses or fails those checks, four more rays `aimToleranceDe
 0 turns it off) off-axis are tried in the order up, left, right, down, first usable hit wins, so a
 thin edge just past the crosshair still catches. The off-axis basis is world-space (x east, y north,
 z up): right = forward x up flattened (facing +y gives +x), camera-up = right x forward. 2 deg is
-about 1.6 m of spread at 45 m, so the result still reads as the pointed-at spot. No usable hit is a
-soft fail: no state change, the tap stays the game's own jump, and "Last shot" in the panel says
-which ray hit what and why it was rejected (or that nothing was in range).
+about 1.6 m of spread at 45 m, so the result still reads as the pointed-at spot.
+
+### Auto-anchor fallback (C2WS-T34)
+
+Direct aim always wins: the assist runs only when every aimed ray above missed or was rejected
+(`sling.assistEnabled`, on by default). It is the Spider-Man 2 "keep the chain going" behavior:
+crosshair on open sky still swings if there is geometry ahead. The **travel heading** is V's
+horizontal velocity (the carry velocity while carrying, else the position-delta estimate) when it is
+at least `assistMinTravelSpeed` (3 m/s), else the flat camera heading. Rays fan out from the eye at
+each `assistYawDeg` offset (0, +/-20, +/-40) and each `assistPitchDeg` elevation (30, 45, 60, 70),
+20 rays out to `AnchorMaxDistance`. In world space (x/y horizontal, z up) a yaw offset `a` rotates
+the unit heading `h` about +z, `h' = (hx cos a - hy sin a, hx sin a + hy cos a)`, and pitch `p`
+lifts it: `dir = (cos p * h'x, cos p * h'y, sin p)`, unit length (heading +y, a 0, p 45 gives
+(0, 0.707, 0.707): up and ahead). A hit must pass the same sanity checks as an aimed hit
+(`minAnchorHeight`, `minAnchorHorizontal`, `minAnchorDistance`) and lie in front of V along the
+heading; survivors are scored like the pre-C2WS-T30 cone search,
+`8 cos(a) + 0.5 * height + 0.4 * min(ahead, 25)`, so on-heading, high and well-ahead points win.
+
+**Decision: no sky web.** If the assist finds nothing either (truly open sky, no geometry in range),
+the tap misses: no invisible anchor is invented. That is a soft fail: no state change, the tap stays
+the game's own jump. The panel's "Last shot" line is prefixed with the path that ran, `aimed:`,
+`assist:` or `miss:`, followed by which ray hit what and why it was rejected (or that nothing was in
+range), plus the assist's ray and hit counts.
 
 ### Attach: propel, then the elastic swing (C2WS-T30)
 
@@ -177,7 +197,7 @@ tap-to-shoot dispatch above grew from.
 
 Not yet verified in-game; the agent that implemented C2WS-T30 could not run the game. Outstanding
 checks from the ticket: (1) mid-air, point at a specific spot on a building, tap jump, and confirm
-the web attaches exactly there (the panel's "Last shot" says "centre ray" when no tolerance ray was
+the web attaches exactly there (the panel's "Last shot" says "aimed: centre ray" when no tolerance ray was
 needed) with an immediate visible pull toward it before the pendulum arc takes over; (2) tap jump at
 the top, bottom and mid-arc of different swings and confirm a plain release with current momentum
 every time ("Last release: tap released"); (3) tap again mid-air with no web and no wall nearby and

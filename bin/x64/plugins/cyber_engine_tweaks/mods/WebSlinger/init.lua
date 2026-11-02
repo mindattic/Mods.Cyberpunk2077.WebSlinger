@@ -69,6 +69,12 @@ local WebSlinger = {
     minAnchorHorizontal = 1.5,  -- reject anchors almost straight overhead (no swing room)
     minAnchorDistance = 5.0,    -- reject anchors this close to V's hand (nothing to swing on)
     aimToleranceDeg = 2.0,      -- if the centre ray whiffs, retry this far off-axis (up/left/right/down)
+    -- Auto-anchor fallback (C2WS-T34): only when every aimed ray misses, fan rays above and ahead
+    -- along V's travel direction and take the best-scoring hit. Open sky with nothing in range still misses.
+    assistEnabled = true,
+    assistYawDeg = { 0, -20, 20, -40, 40 },  -- yaw offsets from the travel heading
+    assistPitchDeg = { 30, 45, 60, 70 },     -- elevation above horizontal
+    assistMinTravelSpeed = 3.0,  -- horizontal m/s below which the look heading stands in for travel
     eyeHeight = 1.7,            -- aim ray starts this far above V's feet (first-person camera estimate)
     handHeight = 1.5,           -- rope attaches to V this far above her feet
     -- Propel-then-elastic attach (C2WS-T30): yank toward the anchor, then the pendulum takes over.
@@ -107,6 +113,7 @@ local WebSlinger = {
   -- Visible swing cable (C2WS-T25) tunables. In first person V's real hand point (her body centre)
   -- sits under the camera, so the cable is drawn from a point just ahead of the camera, offset to
   -- the lower right where V's right hand shows on screen. Distances in metres along the camera axes.
+    lastShotPath = "none",      -- "aimed", "assist" or "miss": which FindAnchor path the last tap took (C2WS-T34)
   rope = {
     thickness = 4.0,            -- core cable width in pixels (the old debug line was 2.0)
     color = { 0.10, 0.85, 1.00, 0.95 },  -- electric cyan; never the debug overlay's green/red/yellow
@@ -441,13 +448,16 @@ end
 -- above V's feet (not the ground at her feet), at least minAnchorHorizontal away flat (not straight
 -- overhead) and at least minAnchorDistance from her hand (room to swing). Only when the centre ray
 -- misses or fails those checks are four rays aimToleranceDeg off-axis (up, left, right, down) tried,
--- so a thin edge just past the crosshair still catches. Returns anchor (Vector4) and normal
--- (Vector4), or nil, nil; the third return is a one-line summary for the debug panel.
+-- so a thin edge just past the crosshair still catches. Only if every aimed ray fails does the
+-- auto-anchor assist (C2WS-T34) run: a fan of rays pitched assistPitchDeg above horizontal at
+-- assistYawDeg around V's travel direction, scored for being ahead, high and far enough forward.
+-- Returns anchor (Vector4) and normal (Vector4), or nil, nil; the third return is a one-line
+-- summary for the debug panel and the fourth is the path taken: "aimed", "assist" or "miss".
 function WebSlinger.FindAnchor(player)
   local cfg = WebSlinger.sling
   local pos = player:GetWorldPosition()
   local f = aimForward(player)
-  if f == nil then return nil, nil, "no aim direction" end
+  if f == nil then return nil, nil, "no aim direction", "miss" end
   local eye = vec4(pos.x, pos.y, pos.z + cfg.eyeHeight)
   local handZ = pos.z + cfg.handHeight
 
@@ -492,12 +502,68 @@ function WebSlinger.FindAnchor(player)
         local anchor = vec4(hitPos.x + hitNormal.x * 0.1, hitPos.y + hitNormal.y * 0.1,
           hitPos.z + hitNormal.z * 0.1)
         return anchor, hitNormal, string.format("%s ray: anchor %.1fm away, %.1fm up",
-          ray[1], dist, anchor.z - pos.z)
+          ray[1], dist, anchor.z - pos.z), "aimed"
       end
       firstMiss = firstMiss or (ray[1] .. " ray hit " .. why)
     end
   end
-  return nil, nil, firstMiss or string.format("nothing within %.0fm along the aim", cfg.AnchorMaxDistance)
+  local aimMiss = firstMiss or string.format("nothing within %.0fm along the aim", cfg.AnchorMaxDistance)
+  if not cfg.assistEnabled then return nil, nil, aimMiss, "miss" end
+
+  -- Auto-anchor assist (C2WS-T34). Travel heading (hx, hy): V's horizontal carry/swing velocity
+  -- (the estimate when not carrying), else the flat look heading when she is nearly stationary.
+  local sw = WebSlinger.swing
+  local v = (sw.carry and sw.vel) or sw.estVel
+  local hx, hy = 0.0, 0.0
+  local vlen = 0.0
+  if v ~= nil then
+    hx, hy = v.x, v.y
+    vlen = math.sqrt(hx * hx + hy * hy)
+  end
+  if vlen >= cfg.assistMinTravelSpeed then
+    hx, hy = hx / vlen, hy / vlen
+  else
+    hx, hy = aimHeading(player, false)
+  end
+
+  -- Each ray: rotate the heading by yaw offset a about +z (a > 0 turns left, counter-clockwise seen
+  -- from above: (hx cos a - hy sin a, hx sin a + hy cos a)), then lift it by pitch p:
+  -- dir = (cos p * yawed, sin p), already unit length since the yawed heading is unit and flat.
+  -- E.g. heading +y, a = 0, p = 45: dir = (0, 0.707, 0.707), up and ahead.
+  local best, bestNormal, bestScore, bestAhead = nil, nil, -math.huge, 0.0
+  local rays, hits = 0, 0
+  for _, yawDeg in ipairs(cfg.assistYawDeg) do
+    local a = math.rad(yawDeg)
+    local ca, sa = math.cos(a), math.sin(a)
+    local yx, yy = hx * ca - hy * sa, hx * sa + hy * ca
+    for _, pitchDeg in ipairs(cfg.assistPitchDeg) do
+      local p = math.rad(pitchDeg)
+      local cp, sp = math.cos(p), math.sin(p)
+      rays = rays + 1
+      local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(eye,
+        Vector4.new(cp * yx, cp * yy, sp, 0.0), cfg.AnchorMaxDistance)
+      if hit then
+        hits = hits + 1
+        -- ahead: how far the hit lies along the travel heading (flat); must be in front of V.
+        local ahead = (hitPos.x - pos.x) * hx + (hitPos.y - pos.y) * hy
+        if rejectReason(hitPos) == nil and ahead > 0.0 then
+          -- Same weighting as the pre-C2WS-T30 cone search: on-heading, high, long forward arc.
+          local score = ca * 8.0 + (hitPos.z - pos.z) * 0.5 + math.min(ahead, 25.0) * 0.4
+          if score > bestScore then
+            best, bestNormal, bestScore, bestAhead = hitPos, hitNormal, score, ahead
+          end
+        end
+      end
+    end
+  end
+
+  if best == nil then
+    -- Truly open sky (or nothing sane in range): the tap misses; there is no invisible sky web.
+    return nil, nil, string.format("%s; assist: %d rays, %d hits, none qualified", aimMiss, rays, hits), "miss"
+  end
+  local anchor = vec4(best.x + bestNormal.x * 0.1, best.y + bestNormal.y * 0.1, best.z + bestNormal.z * 0.1)
+  return anchor, bestNormal, string.format("anchor %.1fm ahead, %.1fm up, %d/%d rays hit (aim: %s)",
+    bestAhead, anchor.z - pos.z, hits, rays, aimMiss), "assist"
 end
 
 -- Moves the simulated body from swing.pos to (nx, ny, nz) without passing through world geometry.
@@ -640,12 +706,14 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
 end
 
 -- Fires the rope at the aimed point (FindAnchor) and gives V the propel impulse toward it
--- (C2WS-T30). Soft-fails (returns false, no state change) when the aim ray finds nothing usable,
--- so V just keeps falling normally.
+-- (C2WS-T30). On a full aim miss FindAnchor's auto-anchor assist (C2WS-T34) may supply a point
+-- above and ahead instead. Soft-fails (returns false, no state change) when neither finds anything
+-- usable, so V just keeps falling normally.
 local function tryAttach(player)
   local s, cfg = WebSlinger.swing, WebSlinger.sling
-  local anchor, normal, info = WebSlinger.FindAnchor(player)
-  s.lastSearch = info
+  local anchor, normal, info, path = WebSlinger.FindAnchor(player)
+  s.lastShotPath = path or "miss"
+  s.lastSearch = s.lastShotPath .. ": " .. tostring(info)
   if anchor == nil then return false end
 
   local pos = player:GetWorldPosition()
