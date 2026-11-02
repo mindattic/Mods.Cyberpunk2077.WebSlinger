@@ -110,6 +110,22 @@ local WebSlinger = {
     attachCount = 0,
   },
 
+  -- Visible swing cable (C2WS-T25) tunables. In first person V's real hand point (her body centre)
+  -- sits under the camera, so the cable is drawn from a point just ahead of the camera, offset to
+  -- the lower right where V's right hand shows on screen. Distances in metres along the camera axes.
+  rope = {
+    thickness = 4.0,            -- core cable width in pixels (the old debug line was 2.0)
+    color = { 0.10, 0.85, 1.00, 0.95 },  -- electric cyan; never the debug overlay's green/red/yellow
+    glowScale = 3.0,            -- soft halo drawn under the core, this many times its width
+    glowAlpha = 0.25,           -- halo opacity relative to the core colour
+    anchorRadius = 5.0,         -- dot at the anchor end, pixels
+    handForward = 0.6,          -- cable start: this far ahead of the camera
+    handRight = 0.25,           -- ... this far to its right
+    handDown = 0.3,             -- ... and this far below it
+    cameraHeight = 1.7,         -- camera height above V's feet, for the start point and clipping
+    nearClip = 0.1,             -- parts of the cable closer than this to the camera plane are cut
+  },
+
   -- Wall-impact check during a swing (C2WS-T7) tunables.
   impact = {
     WallCheckDistance = 2.0,         -- metres ahead of V's velocity the impact probe reaches
@@ -1765,6 +1781,101 @@ local function updateWallProbe()
   probe.hitNormal = hitNormal
 end
 
+-- ---------------------------------------------------------------------------------------------
+-- Monowire hand anchor (C2WS-T26), cosmetic only.
+--
+-- Showing the real Monowire model deploying is not reachable from CET Lua alone without touching
+-- V's real equipment (see docs/DESIGN.md, "Gap: no Monowire model from CET"), so this ships the
+-- documented fallback: the swing line starts at V's right-hand attachment slot instead of a fixed
+-- point above her feet, so the wire reads as fired from her hand. Read-only: it only queries a slot
+-- transform, never equips, draws, holsters or spawns anything, so V's weapon/cyberware state is
+-- untouched before, during and after a swing. Every engine call is pcall-guarded; if no candidate
+-- slot resolves (or a reading is implausible) the line falls back to an estimated hand point.
+-- ---------------------------------------------------------------------------------------------
+
+WebSlinger.monowire = {
+  HandAnchor = true,  -- false = old behaviour: the line starts handHeight above V's feet
+  -- Player components and slot names tried in order; the first pair that returns a transform wins.
+  components = { "Item_Attachment_Slot", "AttachmentSlots", "SlotComponent" },
+  slots = { "RightHand", "WeaponRight", "r_hand", "RightArm" },
+  MaxSlotOffset = 2.5,   -- a slot reading farther than this from the estimated hand is rejected
+  FallbackReach = 0.35,  -- fallback: hand point this far from the shoulder toward the anchor
+  -- Live state (written only by monowireHandPoint, read by the debug panel).
+  resolvedFor = -1,      -- swing.attachCount the slot was resolved for (re-resolved each swing)
+  component = nil,       -- cached slot component for the current swing
+  slot = nil,            -- CName of the working slot for the current swing
+  source = "(no swing yet)",
+}
+
+-- Reads a world position from a slot component's slot. CET hands an `out` parameter back as an
+-- extra return value, but older builds fill the struct passed in, so both are accepted.
+local function readSlotPosition(component, slotName)
+  local ok, pos = pcall(function()
+    local wt = WorldTransform.new()
+    local found, outWt = component:GetSlotTransform(slotName, wt)
+    if found == false then return nil end
+    local t = (type(outWt) == "userdata") and outWt or wt
+    return WorldPosition.ToVector4(WorldTransform.GetWorldPosition(t))
+  end)
+  if not ok or pos == nil or pos.x == nil then return nil end
+  -- An unfilled transform reads as the world origin; never anchor the wire there.
+  if pos.x == 0 and pos.y == 0 and pos.z == 0 then return nil end
+  return pos
+end
+
+local function resolveHandSlot(player, estimate)
+  local m = WebSlinger.monowire
+  m.component, m.slot = nil, nil
+  for _, compName in ipairs(m.components) do
+    local okc, comp = pcall(function() return player:FindComponentByName(CName.new(compName)) end)
+    if okc and comp ~= nil then
+      for _, slotName in ipairs(m.slots) do
+        local slot = CName.new(slotName)
+        local p = readSlotPosition(comp, slot)
+        if p ~= nil and lengthOf({ x = p.x - estimate.x, y = p.y - estimate.y, z = p.z - estimate.z })
+            <= m.MaxSlotOffset then
+          m.component, m.slot = comp, slot
+          m.source = compName .. "/" .. slotName
+          return p
+        end
+      end
+    end
+  end
+  m.source = "estimate (no hand slot readable)"
+  return nil
+end
+
+-- World point the swing line starts from: V's right-hand slot while it resolves, else an estimate
+-- (shoulder height, reaching a little toward the anchor). Called from onDraw while grappling.
+local function monowireHandPoint()
+  local s, m = WebSlinger.swing, WebSlinger.monowire
+  local shoulder = vec4(s.pos.x, s.pos.y, s.pos.z + WebSlinger.sling.handHeight)
+  if not m.HandAnchor then return shoulder end
+
+  local toAnchor = normalized(Vector4.new(s.anchor.x - shoulder.x, s.anchor.y - shoulder.y,
+    s.anchor.z - shoulder.z, 0.0))
+  local estimate = shoulder
+  if toAnchor ~= nil then
+    estimate = vec4(shoulder.x + toAnchor.x * m.FallbackReach, shoulder.y + toAnchor.y * m.FallbackReach,
+      shoulder.z + toAnchor.z * m.FallbackReach)
+  end
+
+  local player = Game.GetPlayer()
+  if player == nil then return estimate end
+  local p = nil
+  if m.resolvedFor ~= s.attachCount then
+    m.resolvedFor = s.attachCount
+    p = resolveHandSlot(player, estimate)
+  elseif m.component ~= nil then
+    p = readSlotPosition(m.component, m.slot)
+    if p ~= nil and lengthOf({ x = p.x - estimate.x, y = p.y - estimate.y, z = p.z - estimate.z })
+        > m.MaxSlotOffset then
+      p = nil
+    end
+  end
+  return p or estimate
+end
+
 -- Projects a world point to screen pixels. Returns nil when the point is behind the camera or
 -- far off-screen.
 local function worldToScreen(point)
@@ -1817,7 +1928,7 @@ local function drawRope()
   if not WebSlinger.IsGrappling or s.anchor == nil or s.pos == nil then return end
   local drawList = ImGui.GetBackgroundDrawList()
   local white = ImGui.GetColorU32(0.95, 0.95, 0.95, 0.9)
-  local hand = vec4(s.pos.x, s.pos.y, s.pos.z + WebSlinger.sling.handHeight)
+  local hand = monowireHandPoint()  -- V's right-hand slot, else an estimate (C2WS-T26)
   drawWorldLine(drawList, hand, s.anchor, white, 2.0)
   drawWorldPoint(drawList, s.anchor, white, 4.0)
 end
@@ -2086,6 +2197,12 @@ registerForEvent("onDraw", function()
   pp.ShakeDuration = ImGui.SliderFloat("Impact shake time", pp.ShakeDuration, 0.0, 1.0)
   pp.FovPunchDeg = ImGui.SliderFloat("Impact FOV punch (deg)", pp.FovPunchDeg, 0.0, 15.0)
   pp.JumpScale = ImGui.SliderFloat("Wall-jump feedback scale", pp.JumpScale, 0.0, 1.5)
+
+  -- Monowire hand anchor (C2WS-T26): cosmetic only, never touches V's equipment.
+  ImGui.Separator()
+  local mw = WebSlinger.monowire
+  mw.HandAnchor = ImGui.Checkbox("Monowire: swing line starts at V's hand", mw.HandAnchor)
+  ImGui.Text("Hand anchor source: " .. tostring(mw.source))
 
   ImGui.Separator()
   if ImGui.Button("Send Peter Parker intro text") then

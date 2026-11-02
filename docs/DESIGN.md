@@ -491,6 +491,59 @@ Not yet verified in-game (the implementing agent could not run the game). Outsta
 tilt eases in and out with no snap; the shake and FOV punch read on a latch and a wall-jump; the
 "Frame" counter stays at its polish-off baseline with polish on.
 
+## Monowire visual on V's hand (C2WS-T26)
+
+Cosmetic only. Like the climb (see "No equipment gate"), nothing here checks or requires real
+cyberware, and nothing may change what V actually has equipped or drawn.
+
+### Gap: no Monowire model from CET
+
+Spiked from CET Lua alone (no RED4ext, no redscript), the three candidates:
+
+- **(a) Toggle a Monowire visual/appearance on V's arm.** In CP77 the Monowire is a weapon item
+  that only renders when the equipment state machine draws it into the right-hand weapon slot.
+  CET can reach `EquipmentSystem` / `TransactionSystem` (draw requests, `AddItemToSlot`,
+  `GiveItem`), but every one of those changes real state: it holsters or replaces a drawn weapon,
+  changes the active weapon selection, or adds an inventory item, and the swap persists unless
+  restored exactly. There is no exposed "appearance only" path (`ItemsFactoryAppearance`
+  changes need an item entity spawned in a slot, which is the same `TransactionSystem` mutation).
+  It also only works when V has the Monowire installed. Rejected: violates "never alter V's
+  equipped cyberware/weapon state".
+- **(b) Play the Monowire deploy animation.** The deploy/whip animations are driven by the
+  weapon state machine and animation features bound to the drawn item; there is no standalone
+  animation request exposed to script that plays them on V's arms without that item drawn.
+  Rejected for the same reason as (a).
+- **(c) Anchor the line at V's hand.** Reachable read-only: `FindComponentByName` on the player
+  plus `SlotComponent.GetSlotTransform` returns a slot's world transform without touching
+  equipment. **Shipped.**
+
+A genuine Monowire-model deploy would need a RED4ext-level hook (or redscript + Codeware) into the
+equipment/animation systems to drive a visual-only item. That breaks the README's "CET and nothing
+else" requirement, so it is left as a follow-up needing its own explicit go-ahead.
+
+### What ships: hand-anchored swing line
+
+`monowireHandPoint()` (init.lua, called by `drawRope()`) starts the swing line at V's right-hand
+attachment slot. On each new swing it tries the `WebSlinger.monowire.components` x `slots`
+candidates (`Item_Attachment_Slot` / `RightHand`, `WeaponRight`, ... ) once, caches the first that
+returns a plausible transform (within `MaxSlotOffset` of the expected hand), and reads it every
+draw frame. If none resolves, or a reading is implausible, the line falls back to an estimate:
+shoulder height (`sling.handHeight`), `FallbackReach` metres toward the anchor. Swing physics are
+unchanged; only where the line is drawn from moves. Every engine call is `pcall`-guarded.
+
+Debug panel: **Monowire: swing line starts at V's hand** (off = the old fixed start point) and
+**Hand anchor source** (the component/slot in use, or `estimate`).
+
+### Verification status
+
+Not yet verified in-game (the implementing agent could not run the game). Outstanding checks:
+swing and confirm "Hand anchor source" names a slot (not `estimate`) and the line visibly leaves
+V's hand in third person and in first person (the FPP arms are a separate rig, so the slot may sit
+slightly off the visible FPP hand; tune or add a slot name if so); then with a weapon drawn and
+with the Monowire equipped, swing and release and confirm the drawn weapon, the selected
+cyberware and the inventory are exactly as before (the code makes no equipment calls, so this is
+expected to hold).
+
 ## Implementation approach (open question)
 
 CET's Lua layer can hook input, read/write exposed RTTI properties, and draw debug UI, but V's
