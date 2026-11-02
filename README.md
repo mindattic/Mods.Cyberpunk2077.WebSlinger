@@ -58,8 +58,10 @@ Nothing else: no redscript, TweakXL, ArchiveXL, Codeware or RED4ext.
 1. Start the game. The CET console and log should show `[WebSlinger] loaded`.
 2. Open the CET overlay (its key is set in CET's first-run screen), find the **WebSlinger** window
    and tick **Enabled**. The mod starts disabled every session and does not remember the tick.
-3. Bind the web-sling hold-to-swing control in the CET overlay's **Bindings** tab under
-   **WebSlinger** (no default key; see `docs/DESIGN.md` for the suggested bind).
+3. Nothing to bind: every move uses the game's own **Jump**. Mid-air, look at the spot you want and
+   tap jump to shoot a web there (it pulls you in, then swings); tap jump again any time to let go
+   with your momentum, and once more mid-air to shoot the next web. Near a wall, jump wall-runs or
+   latches on first, as before.
 
 ## Uninstall
 

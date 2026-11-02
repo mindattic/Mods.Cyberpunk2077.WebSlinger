@@ -7,7 +7,9 @@
 -- (C2WS-T9: wall-parallel run velocity, sticky force, camera tilt, manual jump-key trigger), and the
 -- wall-jump off a climb or wall-run, chainable between facing walls (C2WS-T11), and the
 -- end-to-end re-sling loop pass (C2WS-T12: state-leak fixes plus a transition log), and the polish
--- pass (C2WS-T13: eased wall-run camera tilt, impact shake + FOV punch on latch and wall-jump). See
+-- pass (C2WS-T13: eased wall-run camera tilt, impact shake + FOV punch on latch and wall-jump), and
+-- the tap-only web (C2WS-T30: jump tap shoots at the crosshair with a propel-then-elastic attach and
+-- taps again to let go; it replaced T6's hold-to-swing bind and cone search). See
 -- docs/DESIGN.md in the repo root for the states, the raycast API notes, and the design decisions.
 
 -- Traversal states (C2WS-T5). Every mechanic reads and changes the current state only through
@@ -61,13 +63,17 @@ local WebSlinger = {
 
   -- Web-sling tunables. All distances in metres, times in seconds, accelerations in m/s^2.
   sling = {
-    AnchorMaxDistance = 45.0,   -- how far the anchor search reaches
-    minAnchorHeight = 3.0,      -- anchor must sit at least this far above V's feet
+    AnchorMaxDistance = 45.0,   -- how far the aim ray reaches
+    -- Direct aim (C2WS-T30): the anchor is wherever the camera-forward ray hits, if it passes these.
+    minAnchorHeight = 2.0,      -- anchor must sit at least this far above V's feet (no ground at her feet)
     minAnchorHorizontal = 1.5,  -- reject anchors almost straight overhead (no swing room)
-    searchYawDeg = { -45.0, -22.5, 0.0, 22.5, 45.0 },  -- cone of sample rays around the aim heading
-    searchPitchDeg = { 20.0, 35.0, 50.0, 65.0 },       -- elevation of each sample ray above horizontal
-    eyeHeight = 1.6,            -- sample rays start this far above V's feet
+    minAnchorDistance = 5.0,    -- reject anchors this close to V's hand (nothing to swing on)
+    aimToleranceDeg = 2.0,      -- if the centre ray whiffs, retry this far off-axis (up/left/right/down)
+    eyeHeight = 1.7,            -- aim ray starts this far above V's feet (first-person camera estimate)
     handHeight = 1.5,           -- rope attaches to V this far above her feet
+    -- Propel-then-elastic attach (C2WS-T30): yank toward the anchor, then the pendulum takes over.
+    AttachPropelSpeed = 18.0,   -- speed (m/s) toward the anchor V is guaranteed on attach
+    PropelDuration = 0.35,      -- seconds the rope shortens to follow her in before the swing settles
     gravity = 9.81 * 1.6,       -- swing gravity; a bit heavier than real for a snappier arc
     damping = 0.02,             -- fraction of velocity bled per second while swinging
     reelSpeed = 4.0,            -- rope shortens this fast, pulling V toward the anchor
@@ -76,38 +82,26 @@ local WebSlinger = {
     anchorReachDistance = 2.5,  -- reaching this close to the anchor ends the swing
     maxSwingTime = 8.0,         -- safety cap on a single swing
     maxSpeed = 40.0,            -- velocity clamp while swinging/carrying
-    chainMinSwingTime = 0.45,   -- with the key held, auto-release only after this long on the rope
-    chainReleaseAngleDeg = 35.0,-- ... and once V has swung this far past the bottom, rising
-    -- Boost leap (C2WS-T23): jump near the bottom of the arc lets go toward the look heading.
-    leapBottomWindowDeg = 25.0, -- jump counts as "at the bottom" within this angle of straight down
-    leapBoostSpeed = 24.0,      -- horizontal launch speed floor along the look heading
-    leapSpeedBonus = 6.0,       -- ... or current swing speed plus this, whichever is faster
-    leapLift = 6.0,             -- vertical speed floor (m/s) at launch, so the leap clears the arc
-    retryInterval = 0.15,       -- with the key held and no rope, re-search this often
     launchSpeed = 5.0,          -- upward hop (m/s) when firing from the ground
     carryMaxTime = 4.0,         -- momentum carry after release hands back to native physics after this
   },
 
   -- Live web-sling state. Written only by the onUpdate tick (and SetState hooks).
   swing = {
-    keyHeld = false,      -- current state of the CET-bound swing input, polled each tick
-    keyWasHeld = false,   -- keyHeld as of the previous tick, for edge detection
-    auto = false,         -- current swing was auto-fired by a mid-air jump, not the held bind (C2WS-T22)
-    autoCount = 0,        -- swings auto-fired by a mid-air jump, for the panel
-    leapCount = 0,        -- bottom-of-swing boost leaps (C2WS-T23), for the panel
     anchor = nil,        -- Vector4 world anchor point while attached
     anchorNormal = nil,   -- surface normal at the anchor
     ropeLength = 0.0,
     pos = nil,            -- simulated feet position (Vector4) while attached or carrying
     vel = nil,            -- simulated velocity { x, y, z } while attached or carrying
     time = 0.0,           -- seconds on the current rope
-    retryTimer = 0.0,
-    carry = false,        -- true while post-release momentum is still being integrated
+    propelling = false,   -- true during the attach yank, before the elastic swing settles (C2WS-T30)
+    carry = false,       -- true while post-release momentum is still being integrated
     carryTime = 0.0,
     lastPos = nil,        -- V's position last tick, for the velocity estimate below
     estVel = { x = 0.0, y = 0.0, z = 0.0 },  -- smoothed velocity of V from position deltas
-    lastSearch = "(none yet)",  -- one-line result of the last anchor search, for the panel
+    lastSearch = "(none yet)",  -- one-line result of the last aimed shot, for the panel
     attachCount = 0,
+    tapReleaseCount = 0,  -- swings let go with a jump tap (C2WS-T30), for the panel
   },
 
   -- Visible swing cable (C2WS-T25) tunables. In first person V's real hand point (her body centre)
@@ -377,8 +371,6 @@ end
 -- slack, never stretch (a pendulum), and written back with the teleportation facility each tick.
 -- ---------------------------------------------------------------------------------------------
 
-local atan2 = math.atan2 or math.atan
-
 local function swingSpeed(v)
   return math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
 end
@@ -434,50 +426,78 @@ local function isGrounded(pos)
   return hit
 end
 
---- Generous anchor search: a cone of sample rays ahead of and above V, centred on where the
--- player is roughly looking/moving, out to sling.AnchorMaxDistance. Every ray is a line-of-sight
--- test by construction (ExecuteSmartRaycast returns the first surface it touches). Picks the best
--- qualifying high point. Returns anchor (Vector4) and normal (Vector4), or nil, nil; the third
--- return is a one-line summary for the debug panel.
+-- Unit 3D direction the crosshair points along (the active camera's forward, pitch included), or
+-- V's facing when the camera system can't be read. nil only if both are degenerate.
+local function aimForward(player)
+  local ok, f = pcall(function() return Game.GetCameraSystem():GetActiveCameraForward() end)
+  if not ok or f == nil then f = player:GetWorldForward() end
+  if f == nil then return nil end
+  return normalized(f)
+end
+
+--- Direct-aim anchor (C2WS-T30): one ray from the camera along its exact forward (the crosshair),
+-- out to sling.AnchorMaxDistance; whatever it hits is the anchor, with no scoring and no search for
+-- a "better" point nearby. The hit only has to be a sane attach point: at least minAnchorHeight
+-- above V's feet (not the ground at her feet), at least minAnchorHorizontal away flat (not straight
+-- overhead) and at least minAnchorDistance from her hand (room to swing). Only when the centre ray
+-- misses or fails those checks are four rays aimToleranceDeg off-axis (up, left, right, down) tried,
+-- so a thin edge just past the crosshair still catches. Returns anchor (Vector4) and normal
+-- (Vector4), or nil, nil; the third return is a one-line summary for the debug panel.
 function WebSlinger.FindAnchor(player)
   local cfg = WebSlinger.sling
   local pos = player:GetWorldPosition()
-  local hx, hy = aimHeading(player, true)
-  local baseYaw = atan2(hy, hx)
+  local f = aimForward(player)
+  if f == nil then return nil, nil, "no aim direction" end
   local eye = vec4(pos.x, pos.y, pos.z + cfg.eyeHeight)
+  local handZ = pos.z + cfg.handHeight
 
-  local best, bestNormal, bestScore = nil, nil, -math.huge
-  local rays, hits = 0, 0
-  for _, yawOffset in ipairs(cfg.searchYawDeg) do
-    local yaw = baseYaw + math.rad(yawOffset)
-    local alignment = math.cos(math.rad(yawOffset))
-    for _, pitchDeg in ipairs(cfg.searchPitchDeg) do
-      local pitch = math.rad(pitchDeg)
-      local dir = Vector4.new(math.cos(pitch) * math.cos(yaw), math.cos(pitch) * math.sin(yaw), math.sin(pitch), 0.0)
-      rays = rays + 1
-      local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(eye, dir, cfg.AnchorMaxDistance)
-      if hit then
-        hits = hits + 1
-        local height = hitPos.z - pos.z
-        local dx, dy = hitPos.x - pos.x, hitPos.y - pos.y
-        local horizontal = math.sqrt(dx * dx + dy * dy)
-        if height >= cfg.minAnchorHeight and horizontal >= cfg.minAnchorHorizontal then
-          -- Prefer anchors near the aim heading, high up, and far enough ahead to give a long arc.
-          local score = alignment * 8.0 + height * 0.5 + math.min(horizontal, 25.0) * 0.4
-          if score > bestScore then
-            best, bestNormal, bestScore = hitPos, hitNormal, score
-          end
-        end
+  -- Why a hit can't be an anchor, or nil if it can. Also returns the hand-to-hit distance.
+  local function rejectReason(p)
+    local dx, dy, dz = p.x - pos.x, p.y - pos.y, p.z - handZ
+    local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if p.z - pos.z < cfg.minAnchorHeight then
+      return string.format("too low (%.1fm above feet)", p.z - pos.z), dist
+    end
+    if math.sqrt(dx * dx + dy * dy) < cfg.minAnchorHorizontal then return "straight overhead", dist end
+    if dist < cfg.minAnchorDistance then return string.format("too close (%.1fm)", dist), dist end
+    return nil, dist
+  end
+
+  -- Camera basis for the off-axis rays, in world space (x east, y north, z up): right = f x up,
+  -- flattened (facing +y gives +x); camUp = right x f (facing +y level gives +z).
+  local rx, ry = f.y, -f.x
+  local rlen = math.sqrt(rx * rx + ry * ry)
+  if rlen < 1e-4 then rx, ry = 1.0, 0.0 else rx, ry = rx / rlen, ry / rlen end
+  local ux, uy, uz = ry * f.z, -rx * f.z, rx * f.y - ry * f.x
+  local t = math.rad(math.max(0.0, cfg.aimToleranceDeg))
+  local c, sn = math.cos(t), math.sin(t)
+  local rays = {
+    { "centre", f.x, f.y, f.z },
+    { "up",    f.x * c + ux * sn, f.y * c + uy * sn, f.z * c + uz * sn },
+    { "left",  f.x * c - rx * sn, f.y * c - ry * sn, f.z * c },
+    { "right", f.x * c + rx * sn, f.y * c + ry * sn, f.z * c },
+    { "down",  f.x * c - ux * sn, f.y * c - uy * sn, f.z * c - uz * sn },
+  }
+  local count = (t > 0.0) and #rays or 1
+
+  local firstMiss = nil
+  for i = 1, count do
+    local ray = rays[i]
+    local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(eye,
+      Vector4.new(ray[2], ray[3], ray[4], 0.0), cfg.AnchorMaxDistance)
+    if hit then
+      local why, dist = rejectReason(hitPos)
+      if why == nil then
+        -- Nudge the anchor out of the surface so the rope end never sits inside geometry.
+        local anchor = vec4(hitPos.x + hitNormal.x * 0.1, hitPos.y + hitNormal.y * 0.1,
+          hitPos.z + hitNormal.z * 0.1)
+        return anchor, hitNormal, string.format("%s ray: anchor %.1fm away, %.1fm up",
+          ray[1], dist, anchor.z - pos.z)
       end
+      firstMiss = firstMiss or (ray[1] .. " ray hit " .. why)
     end
   end
-
-  if best == nil then
-    return nil, nil, string.format("no anchor (%d rays, %d hits, none qualified)", rays, hits)
-  end
-  -- Nudge the anchor out of the surface so the rope end never sits inside geometry.
-  local anchor = vec4(best.x + bestNormal.x * 0.1, best.y + bestNormal.y * 0.1, best.z + bestNormal.z * 0.1)
-  return anchor, bestNormal, string.format("anchor %.1fm up, %d/%d rays hit", anchor.z - pos.z, hits, rays)
+  return nil, nil, firstMiss or string.format("nothing within %.0fm along the aim", cfg.AnchorMaxDistance)
 end
 
 -- Moves the simulated body from swing.pos to (nx, ny, nz) without passing through world geometry.
@@ -521,8 +541,12 @@ end
 
 --- Advances the swing by deltaTime seconds: gravity, steering, damping, reel-in, the rope
 -- constraint (pendulum), collision, then writes V's position. Runs every onUpdate tick while
--- WebSlinger.IsGrappling. Ends the swing (SetState NONE) on reaching the anchor, landing, the
--- safety time cap, or, with the key still held, the chain-release point on the upswing.
+-- WebSlinger.IsGrappling. During the attach propel phase (C2WS-T30, swing.propelling) the rope also
+-- shortens to follow V in as she is yanked toward the anchor, so it never goes slack; the phase ends
+-- after sling.PropelDuration or once the rope is down to minRopeLength, whichever comes first, and
+-- the leftover inward speed is dropped there (the web "catches") so the elastic pendulum starts on a
+-- taut rope. Ends the swing (SetState NONE) on reaching the anchor, landing, or the safety time cap;
+-- letting go otherwise is only ever a jump tap (see updateWallRun).
 function WebSlinger.UpdateGrapplePhysics(deltaTime)
   local s, cfg = WebSlinger.swing, WebSlinger.sling
   local player = Game.GetPlayer()
@@ -556,8 +580,11 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
   v.x, v.y, v.z = v.x * keep, v.y * keep, v.z * keep
   clampSpeed(v, cfg.maxSpeed)
 
-  -- Reel in: shortening the rope is what pulls V toward the anchor, along the arc.
-  s.ropeLength = math.max(cfg.minRopeLength, s.ropeLength - cfg.reelSpeed * dt)
+  -- Reel in: shortening the rope is what pulls V toward the anchor, along the arc. Never lengthens
+  -- a rope that started shorter than minRopeLength (a close aimed anchor).
+  if s.ropeLength > cfg.minRopeLength then
+    s.ropeLength = math.max(cfg.minRopeLength, s.ropeLength - cfg.reelSpeed * dt)
+  end
 
   -- Integrate, then enforce the rope: if the hand point ends up beyond rope length, put it back on
   -- the sphere around the anchor and drop the outward radial velocity. This is what turns a fall
@@ -575,6 +602,26 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
     dist = s.ropeLength
   end
 
+  if s.propelling then
+    -- Propel phase (C2WS-T30): the attach impulse carries V inward (dist < ropeLength), so take up
+    -- the slack. ox/oy/oz point from the anchor out to her hand at the new position.
+    if dist < s.ropeLength then s.ropeLength = math.max(dist, 1e-3) end
+    if s.time >= cfg.PropelDuration or s.ropeLength <= cfg.minRopeLength then
+      s.propelling = false
+      -- Recompute the length: if the constraint above projected V, ox/oy/oz are pre-projection
+      -- (same direction, longer than dist).
+      local olen = math.sqrt(ox * ox + oy * oy + oz * oz)
+      if olen > 1e-4 then
+        local ex, ey, ez = ox / olen, oy / olen, oz / olen
+        local radial = v.x * ex + v.y * ey + v.z * ez
+        if radial < 0.0 then
+          -- Still moving inward: the web catches here, so drop that and keep the tangential part.
+          v.x, v.y, v.z = v.x - radial * ex, v.y - radial * ey, v.z - radial * ez
+        end
+      end
+    end
+  end
+
   local landed = moveWithCollision(s, nx, ny, nz)
   placeV(player, s.pos)
   s.lastPos = vec4(s.pos.x, s.pos.y, s.pos.z)
@@ -589,24 +636,12 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
     releaseSling("reached anchor", true)
   elseif s.time >= cfg.maxSwingTime then
     releaseSling("swing time cap", true)
-  elseif (s.keyHeld or s.auto) and s.time >= cfg.chainMinSwingTime and v.z > 0.0 then
-    -- Chain point: V has swung past the bottom of the arc (in her direction of travel) by at least
-    -- chainReleaseAngleDeg and is rising. Letting go here launches her forward into the next swing.
-    -- A jump-fired swing (C2WS-T22) has no held key to let go of, so it always ends here too.
-    local hx, hy, hz = s.pos.x - a.x, s.pos.y - a.y, (s.pos.z + hand) - a.z
-    local hlen = math.sqrt(hx * hx + hy * hy + hz * hz)
-    local ahead = hx * v.x + hy * v.y > 0.0
-    if ahead and hlen > 1e-4 then
-      local angleFromBottom = math.deg(math.acos(math.max(-1.0, math.min(1.0, -hz / hlen))))
-      if angleFromBottom >= cfg.chainReleaseAngleDeg then
-        releaseSling("chain release", true)
-      end
-    end
   end
 end
 
--- Fires the rope if the anchor search finds a point. Soft-fails (returns false, no state change)
--- when nothing qualifies, so V just keeps falling/running normally.
+-- Fires the rope at the aimed point (FindAnchor) and gives V the propel impulse toward it
+-- (C2WS-T30). Soft-fails (returns false, no state change) when the aim ray finds nothing usable,
+-- so V just keeps falling normally.
 local function tryAttach(player)
   local s, cfg = WebSlinger.swing, WebSlinger.sling
   local anchor, normal, info = WebSlinger.FindAnchor(player)
@@ -623,8 +658,23 @@ local function tryAttach(player)
   end
   s.carry = false
   s.anchor, s.anchorNormal = anchor, normal
+  -- d = anchor - hand (world space, metres): points from V's hand to the anchor.
   local dx, dy, dz = anchor.x - pos.x, anchor.y - pos.y, anchor.z - (pos.z + cfg.handHeight)
   s.ropeLength = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+  -- Propel impulse: raise V's speed toward the anchor (along the unit d) to at least
+  -- AttachPropelSpeed, keeping her sideways momentum; speed already heading in faster is kept as is.
+  -- Seed speed pointing away from the anchor is cancelled by the same top-up.
+  if s.ropeLength > 1e-4 then
+    local ux, uy, uz = dx / s.ropeLength, dy / s.ropeLength, dz / s.ropeLength
+    local toward = s.vel.x * ux + s.vel.y * uy + s.vel.z * uz
+    if toward < cfg.AttachPropelSpeed then
+      local add = cfg.AttachPropelSpeed - toward
+      s.vel.x, s.vel.y, s.vel.z = s.vel.x + ux * add, s.vel.y + uy * add, s.vel.z + uz * add
+    end
+    clampSpeed(s.vel, cfg.maxSpeed)
+  end
+  s.propelling = cfg.PropelDuration > 0.0
   s.time = 0.0
   s.attachCount = s.attachCount + 1
   WebSlinger.SetState(States.SLINGING)
@@ -1236,7 +1286,7 @@ local function observeWallRunJump()
     if not ok or not isJump then return end
 
     -- NONE: manual wall-run trigger. WALLRUNNING: wall-jump off the run (C2WS-T11).
-    -- SLINGING: boost leap near the arc bottom (C2WS-T23), else lets go of a jump-fired swing (C2WS-T22).
+    -- SLINGING: a tap always lets go of the web (C2WS-T30).
     if WebSlinger.state ~= States.NONE and WebSlinger.state ~= States.WALLRUNNING
       and WebSlinger.state ~= States.SLINGING then
       print(string.format("[WebSlinger] jump observed but ignored (state=%s)", WebSlinger.state))
@@ -1247,11 +1297,12 @@ local function observeWallRunJump()
   end)
 end
 
---- Mid-air double-jump web-sling (C2WS-T22): called when jump is pressed in NONE and neither
--- manual wall probe found a wall. If V is airborne, runs the same anchor search and attach as the
--- held swing bind (tryAttach -> FindAnchor along her look heading) and enters SLINGING with no bind
--- held. Grounded presses are left alone (the plain game jump). No anchor is a soft fail: nothing
--- changes and the press stays the game's own jump. Returns true if a swing started.
+--- Tap-to-shoot web (C2WS-T22, direct aim since C2WS-T30): called when jump is tapped in NONE and
+-- neither manual wall probe found a wall. If V is airborne, fires the web at exactly where the
+-- crosshair points (tryAttach -> FindAnchor), applies the propel impulse toward it and enters
+-- SLINGING. Grounded presses are left alone (the plain game jump). Nothing usable under the
+-- crosshair is a soft fail: nothing changes and the press stays the game's own jump. Returns true
+-- if a swing started.
 function WebSlinger.TryJumpSling()
   if WebSlinger.state ~= States.NONE then return false end
   local player = Game.GetPlayer()
@@ -1262,48 +1313,16 @@ function WebSlinger.TryJumpSling()
     print("[WebSlinger] jump-sling: " .. tostring(s.lastSearch))
     return false
   end
-  -- A held bind already owns the swing (hold to swing, release to let go); otherwise it is ours.
-  s.auto = not s.keyHeld
-  s.autoCount = s.autoCount + 1
   print("[WebSlinger] jump-sling: attached (" .. tostring(s.lastSearch) .. ")")
   return true
 end
 
---- Bottom-of-swing boost leap (C2WS-T23): called when jump is pressed while SLINGING. If V's hand
--- point is within sling.leapBottomWindowDeg of straight below the anchor (the same angle-from-bottom
--- measure the chain release uses), overwrites the swing velocity with a boosted launch along her
--- look heading and lets go with momentum carry. The horizontal speed is the faster of
--- leapBoostSpeed and current swing speed + leapSpeedBonus (clamped to maxSpeed); vertical speed is
--- raised to at least leapLift. Outside the window nothing changes and it returns false.
-function WebSlinger.TryBoostLeap()
-  if WebSlinger.state ~= States.SLINGING then return false end
-  local s, cfg = WebSlinger.swing, WebSlinger.sling
-  local player = Game.GetPlayer()
-  local a, v = s.anchor, s.vel
-  if player == nil or a == nil or s.pos == nil or v == nil then return false end
-
-  local hx, hy, hz = s.pos.x - a.x, s.pos.y - a.y, (s.pos.z + cfg.handHeight) - a.z
-  local hlen = math.sqrt(hx * hx + hy * hy + hz * hz)
-  if hlen < 1e-4 then return false end
-  local angleFromBottom = math.deg(math.acos(math.max(-1.0, math.min(1.0, -hz / hlen))))
-  if angleFromBottom > cfg.leapBottomWindowDeg then return false end
-
-  local dx, dy = aimHeading(player, false)
-  local before = swingSpeed(v)
-  local speed = math.min(cfg.maxSpeed, math.max(cfg.leapBoostSpeed, before + cfg.leapSpeedBonus))
-  s.vel = { x = dx * speed, y = dy * speed, z = math.max(v.z, cfg.leapLift) }
-  clampSpeed(s.vel, cfg.maxSpeed)
-  s.leapCount = s.leapCount + 1
-  releaseSling(string.format("boost leap (%.0f deg from bottom, %.1f -> %.1f m/s)",
-    angleFromBottom, before, swingSpeed(s.vel)), true)
-  print("[WebSlinger] " .. s.lastRelease)
-  return true
-end
-
--- One wall-run tick: consumes a queued jump press (manual trigger from NONE, wall-jump while
--- running) and runs the wall-run physics. onUpdate only. From NONE the side wall-run probe runs
--- first, the head-on latch probe only if it found nothing, and, if V is airborne, the jump-fired
--- web-sling only if neither found a wall, so one press triggers at most one.
+-- One wall-run tick: consumes a queued jump press and runs the wall-run physics. onUpdate only.
+-- The queued jump tap is the single trigger for every jump action: WALLRUNNING wall-jumps;
+-- SLINGING always lets go of the web with momentum carry, anywhere in the arc (C2WS-T30); NONE
+-- tries the side wall-run probe first, the head-on latch probe only if it found nothing, and, if V
+-- is airborne, shoots a web at the crosshair only if neither found a wall, so one tap triggers at
+-- most one.
 local function updateWallRun(dt)
   local r = WebSlinger.run
   local jump = r.jumpQueued
@@ -1312,12 +1331,10 @@ local function updateWallRun(dt)
     if jump and WebSlinger.WallJump() then return end
     WebSlinger.UpdateWallHangPhysics(dt)
   elseif jump and WebSlinger.state == States.SLINGING then
-    -- Near the bottom of the arc, any swing's jump is a boost leap toward the look heading
-    -- (C2WS-T23). Elsewhere, a jump during a jump-fired swing lets go with momentum carry
-    -- (C2WS-T22) and a swing held on the dedicated bind ignores jump, as before.
-    if not WebSlinger.TryBoostLeap() and WebSlinger.swing.auto then
-      releaseSling("jump released auto-sling", true)
-    end
+    local s = WebSlinger.swing
+    s.tapReleaseCount = s.tapReleaseCount + 1
+    releaseSling("tap released", true)
+    print("[WebSlinger] jump dispatch: SLINGING, tap released the web")
   elseif jump and WebSlinger.state == States.NONE then
     print("[WebSlinger] jump dispatch: NONE, trying wall-run then wall-latch then jump-sling")
     if not WebSlinger.TryManualWallRun() and not WebSlinger.TryManualWallLatch()
@@ -1378,9 +1395,11 @@ function WebSlinger.CheckWallCollisionDuringSwing()
   return true
 end
 
--- One web-sling tick: polls the swing key, fires/releases, and runs the physics. onUpdate only.
+-- One web-sling tick: runs the swing physics while SLINGING and the momentum carry / velocity
+-- estimate otherwise. Shooting and letting go are jump taps, handled in updateWallRun (C2WS-T30).
+-- onUpdate only.
 local function updateSling(dt)
-  local s, cfg = WebSlinger.swing, WebSlinger.sling
+  local s = WebSlinger.swing
   local player = Game.GetPlayer()
   if player == nil then
     if WebSlinger.state == States.SLINGING then releaseSling("no player", false) end
@@ -1388,19 +1407,11 @@ local function updateSling(dt)
     return
   end
 
-  local held, wasHeld = s.keyHeld, s.keyWasHeld
-  s.keyWasHeld = held
-
   local state = WebSlinger.state
   if state == States.SLINGING then
-    -- Pressing the swing bind during a jump-fired swing hands it over to the bind (C2WS-T22):
-    -- from then on it is an ordinary held swing that ends when the bind is released.
-    if s.auto and held then s.auto = false end
     if s.anchor == nil then
       -- Entered SLINGING without a rope (e.g. the debug Force state button): nothing to swing on.
       releaseSling("no anchor", false)
-    elseif not held and not s.auto then
-      releaseSling("key released", true)
     elseif not WebSlinger.CheckWallCollisionDuringSwing() then
       -- Impact check runs before the physics step, which would otherwise slide V along the wall.
       WebSlinger.UpdateGrapplePhysics(dt)
@@ -1409,20 +1420,6 @@ local function updateSling(dt)
   end
 
   if state == States.NONE then
-    if held then
-      s.retryTimer = s.retryTimer - dt
-      if (not wasHeld) or s.retryTimer <= 0.0 then
-        s.retryTimer = cfg.retryInterval
-        if tryAttach(player) then
-          if not WebSlinger.CheckWallCollisionDuringSwing() then
-            WebSlinger.UpdateGrapplePhysics(dt)
-          end
-          return
-        end
-      end
-    else
-      s.retryTimer = 0.0
-    end
     if s.carry then
       carryTick(player, dt)
     else
@@ -1453,21 +1450,15 @@ StateHooks[States.SLINGING].onExit = function()
     s.lastRelease = "left SLINGING via SetState"
   end
   WebSlinger.IsGrappling = false
-  s.auto = false
+  s.propelling = false
   s.carry = carry and s.anchor ~= nil and s.pos ~= nil and s.vel ~= nil
   s.carryTime = 0.0
   s.releaseCarry = nil
   s.anchor, s.anchorNormal = nil, nil
-  s.retryTimer = WebSlinger.sling.retryInterval
 end
 
--- Player-configurable swing control. CET lists it under Bindings in its overlay; registerInput
--- reports both press (true) and release (false), and the onUpdate tick polls the stored state so
--- one bind covers fire/attach (press) and let go (release). CET inputs have no default key: the
--- player picks one on first run (suggested default and conflict check in docs/DESIGN.md).
-registerInput("webslinger_swing", "Web-sling (hold to swing, release to let go)", function(isDown)
-  WebSlinger.swing.keyHeld = isDown and true or false
-end)
+-- No dedicated swing bind (C2WS-T30): shooting and letting go of the web both use the game's own
+-- Jump action, observed in observeWallRunJump, so there is nothing to bind under CET's Bindings tab.
 
 -- ---------------------------------------------------------------------------------------------
 -- Wall-climb (C2WS-T8), flavoured as a Mantis Blade climb.
@@ -2087,8 +2078,9 @@ local PeterText = {
   sender = "Peter Parker",
   body = "Hey V -- your friendly neighborhood Spider-Man here. Heard you've picked up a few of my "
     .. "old tricks around Night City: climbing walls on your Mantis Blades, wall-runs, wall-jumps, "
-    .. "and a real web-sling swing instead of that grapple-hook thing. Bind a swing key in the CET "
-    .. "overlay (Bindings > WebSlinger), hold it while you face the skyline, and let go to fly.\n\n"
+    .. "and a real web-sling swing instead of that grapple-hook thing. Once you're in the air, look "
+    .. "right at the wall you want and tap jump: the web sticks there and pulls you in. Tap jump "
+    .. "again whenever you like to let go and fly, and once more mid-air to shoot the next one.\n\n"
     .. "Uncle Ben always told me, \"With great power comes great responsibility.\" So swing safe "
     .. "out there, V.\n\n"
     .. "\"You know who I am.\" Your friendly neighborhood Spider-Man.\n\n"
@@ -2257,16 +2249,15 @@ registerForEvent("onDraw", function()
     WebSlinger.timing.frameMs, WebSlinger.timing.raycastMs))
   ImGui.Separator()
   local s, cfg = WebSlinger.swing, WebSlinger.sling
-  ImGui.Text("Web-sling: bind the key under CET Bindings > WebSlinger")
-  ImGui.Text(string.format("Key: %s   Grappling: %s   Carry: %s   Attaches: %d",
-    s.keyHeld and "HELD" or "up", tostring(WebSlinger.IsGrappling), tostring(s.carry), s.attachCount))
-  ImGui.Text(string.format("Jump-sling: %s   Jump-fired swings: %d   Boost leaps: %d",
-    s.auto and "ACTIVE" or "off", s.autoCount, s.leapCount))
+  ImGui.Text("Web-sling: tap jump mid-air to shoot at the crosshair, tap again to let go")
+  ImGui.Text(string.format("Grappling: %s   Propel: %s   Carry: %s   Attaches: %d   Tap releases: %d",
+    tostring(WebSlinger.IsGrappling), s.propelling and "ON" or "off", tostring(s.carry),
+    s.attachCount, s.tapReleaseCount))
   if WebSlinger.IsGrappling and s.vel ~= nil then
     ImGui.Text(string.format("Rope: %.1f m   Speed: %.1f m/s   Time: %.2f s",
       s.ropeLength, swingSpeed(s.vel), s.time))
   end
-  ImGui.Text("Last search: " .. tostring(s.lastSearch))
+  ImGui.Text("Last shot: " .. tostring(s.lastSearch))
   ImGui.Text("Last release: " .. tostring(s.lastRelease or "(none yet)"))
   ImGui.Text("Last wall impact: " .. tostring(WebSlinger.wall.lastImpact))
   local ic = WebSlinger.impact
@@ -2282,6 +2273,9 @@ registerForEvent("onDraw", function()
   cc.speedUp = ImGui.SliderFloat("Climb speed up", cc.speedUp, 0.5, 10.0)
   cc.speedStrafe = ImGui.SliderFloat("Climb strafe speed", cc.speedStrafe, 0.5, 10.0)
   cfg.AnchorMaxDistance = ImGui.SliderFloat("Anchor max distance", cfg.AnchorMaxDistance, 10.0, 100.0)
+  cfg.aimToleranceDeg = ImGui.SliderFloat("Aim tolerance (deg)", cfg.aimToleranceDeg, 0.0, 5.0)
+  cfg.AttachPropelSpeed = ImGui.SliderFloat("Attach propel speed", cfg.AttachPropelSpeed, 0.0, 35.0)
+  cfg.PropelDuration = ImGui.SliderFloat("Propel duration", cfg.PropelDuration, 0.0, 1.0)
   cfg.reelSpeed = ImGui.SliderFloat("Reel speed", cfg.reelSpeed, 0.0, 15.0)
   cfg.gravity = ImGui.SliderFloat("Swing gravity", cfg.gravity, 5.0, 30.0)
   cfg.steerAccel = ImGui.SliderFloat("Steer accel", cfg.steerAccel, 0.0, 20.0)
