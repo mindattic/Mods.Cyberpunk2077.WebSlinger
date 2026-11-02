@@ -91,6 +91,13 @@ local WebSlinger = {
     -- the rope is within BottomPumpWindowDeg of straight down, strongest at the very bottom.
     BottomPumpAccel = 2.5,      -- m/s^2 at the bottom of the arc, fading linearly to 0 at the window edge
     BottomPumpWindowDeg = 30.0, -- half-width of the bottom window (rope angle from vertical)
+    -- Ground skim (C2WS-T33, Spider-Man 2): if the bottom of the arc would put V's feet lower than
+    -- GroundClearance above the ground under her, the rope shortens (at SkimShortenRate, keeping her
+    -- tangential speed) until it doesn't. A ground touch mid-swing slides her along it; only one
+    -- with less than SkimMinSpeed left along the surface still lands.
+    GroundClearance = 1.0,      -- metres the arc's low point (V's feet) is kept above the ground
+    SkimShortenRate = 12.0,     -- m/s the rope may shorten to keep that clearance
+    SkimMinSpeed = 6.0,         -- along-ground speed (m/s) below which a ground touch still lands
     steerAccel = 6.0,           -- tangential push toward the camera's heading while swinging
     anchorReachDistance = 2.5,  -- reaching this close to the anchor ends the swing
     maxSwingTime = 8.0,         -- safety cap on a single swing
@@ -116,6 +123,12 @@ local WebSlinger = {
     lastShotPath = "none",      -- "aimed", "assist" or "miss": which FindAnchor path the last tap took (C2WS-T34)
     attachCount = 0,
     tapReleaseCount = 0,  -- swings let go with a jump tap (C2WS-T30), for the panel
+    -- Ground skim (C2WS-T33), for the panel.
+    skimLowZ = nil,       -- predicted feet height at the bottom of the current arc (world z)
+    skimGroundZ = nil,    -- ground height under V from the downward probe (nil = nothing in reach)
+    skimmedThisSwing = false,  -- the rope was shortened for clearance on the current swing
+    skimCount = 0,        -- swings whose rope was shortened to clear the ground
+    groundSlideCount = 0, -- mid-swing ground touches that slid instead of landing
   },
 
   -- Visible swing cable (C2WS-T25) tunables. In first person V's real hand point (her body centre)
@@ -586,8 +599,11 @@ end
 
 -- Moves the simulated body from swing.pos to (nx, ny, nz) without passing through world geometry.
 -- A walkable surface in the way lands V (returns true); a wall slides her along it and removes
--- the velocity component driving into it.
-local function moveWithCollision(s, nx, ny, nz)
+-- the velocity component driving into it. With skimMinSpeed (a swing, C2WS-T33) a walkable surface
+-- gets the wall treatment too, as long as at least skimMinSpeed is left along it once the velocity
+-- into it is removed: V is set down on it and keeps going (second return true). Slower than that, or
+-- with no skimMinSpeed (the post-release carry), she lands.
+local function moveWithCollision(s, nx, ny, nz, skimMinSpeed)
   local from = vec4(s.pos.x, s.pos.y, s.pos.z + 0.9)
   -- Direction matches V's real per-tick displacement (origin only is raised to chest height);
   -- deriving it from the raised origin toward the unraised target skewed the probe steeply
@@ -599,8 +615,20 @@ local function moveWithCollision(s, nx, ny, nz)
     local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(from, Vector4.new(dx, dy, dz, 0.0), len + 0.1)
     if hit then
       if hitNormal.z > 0.6 and s.vel.z <= 0.0 then
+        if skimMinSpeed ~= nil then
+          local v = s.vel
+          local into = math.min(0.0, v.x * hitNormal.x + v.y * hitNormal.y + v.z * hitNormal.z)
+          local tx, ty, tz = v.x - into * hitNormal.x, v.y - into * hitNormal.y, v.z - into * hitNormal.z
+          if math.sqrt(tx * tx + ty * ty + tz * tz) >= skimMinSpeed then
+            -- Skim: feet on the surface (lifted a hair along its normal), velocity along it kept.
+            v.x, v.y, v.z = tx, ty, tz
+            s.pos = vec4(hitPos.x + hitNormal.x * 0.05, hitPos.y + hitNormal.y * 0.05,
+              hitPos.z + hitNormal.z * 0.05)
+            return false, true
+          end
+        end
         s.pos = vec4(hitPos.x, hitPos.y, hitPos.z)
-        return true
+        return true, false
       end
       local v = s.vel
       local into = v.x * hitNormal.x + v.y * hitNormal.y + v.z * hitNormal.z
@@ -611,7 +639,7 @@ local function moveWithCollision(s, nx, ny, nz)
     end
   end
   s.pos = vec4(nx, ny, nz)
-  return false
+  return false, false
 end
 
 -- Lets go of the rope. carry = true keeps V's swing velocity integrating after release (momentum
@@ -707,6 +735,45 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
     s.ropeLength = math.max(cfg.minRopeLength, s.ropeLength - cfg.reelSpeed * dt)
   end
 
+  -- Ground skim (C2WS-T33): the bottom of this pendulum is straight below the anchor, one rope length
+  -- down, and V's feet hang handHeight under the hand, so the arc's lowest feet height is
+  -- lowZ = anchor.z - ropeLength - handHeight (world z up). Probe straight down from V's chest for the
+  -- ground; if lowZ < groundZ + GroundClearance, shorten the rope toward
+  -- anchor.z - handHeight - (groundZ + GroundClearance), the length whose low point sits exactly at
+  -- the clearance (never below minRopeLength, at most SkimShortenRate x dt per tick, never longer).
+  -- E.g. anchor at z 14, ground at z 0, rope 14 m: lowZ = 14 - 14 - 1.5 = -1.5, under the 1.0 m
+  -- clearance, so the rope heads for 14 - 1.5 - 1.0 = 11.5 m. This runs after keepSpeed was recorded,
+  -- like the reel: the projection below pulls V in by the shortening and keepSpeed then restores her
+  -- speed, so the shortening itself costs no tangential speed. The probe only reaches as far as a
+  -- ground that would matter (down to lowZ - GroundClearance).
+  if not s.propelling then
+    local clearance = cfg.GroundClearance or 0.0
+    local lowZ = a.z - s.ropeLength - hand
+    local originZ = s.pos.z + 0.9
+    local reach = math.min(originZ - (lowZ - clearance) + 0.1, 100.0)
+    local groundZ = nil
+    if reach > 0.0 then
+      local hit, hitPos = WebSlinger.ExecuteSmartRaycast(vec4(s.pos.x, s.pos.y, originZ),
+        Vector4.new(0.0, 0.0, -1.0, 0.0), reach)
+      if hit then groundZ = hitPos.z end
+    end
+    s.skimLowZ, s.skimGroundZ = lowZ, groundZ
+    if groundZ ~= nil and lowZ < groundZ + clearance - 0.01 then
+      local target = math.max(cfg.minRopeLength, a.z - hand - (groundZ + clearance))
+      if target < s.ropeLength then
+        local rate = cfg.SkimShortenRate or 0.0
+        local shortened = (rate > 0.0) and math.max(target, s.ropeLength - rate * dt) or target
+        if shortened < s.ropeLength then
+          s.ropeLength = shortened
+          if not s.skimmedThisSwing then
+            s.skimmedThisSwing = true
+            s.skimCount = s.skimCount + 1
+          end
+        end
+      end
+    end
+  end
+
   -- Integrate, then enforce the rope: if the hand point ends up beyond rope length, put it back on
   -- the sphere around the anchor and drop the outward radial velocity. This is what turns a fall
   -- into a pendulum arc instead of a straight pull to the anchor.
@@ -772,7 +839,9 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
     end
   end
 
-  local landed = moveWithCollision(s, nx, ny, nz)
+  -- A ground touch with SkimMinSpeed left along it slides instead of landing (C2WS-T33).
+  local landed, slid = moveWithCollision(s, nx, ny, nz, cfg.SkimMinSpeed or 0.0)
+  if slid then s.groundSlideCount = s.groundSlideCount + 1 end
   placeV(player, s.pos)
   s.lastPos = vec4(s.pos.x, s.pos.y, s.pos.z)
   -- Keep the velocity estimate current through the swing (C2WS-T12): trackVelocity does not run
@@ -830,6 +899,7 @@ local function tryAttach(player)
   end
   s.propelMinRope = s.ropeLength * (cfg.PropelMinRopeFraction or 0.0)
   s.propelling = cfg.PropelDuration > 0.0
+  s.skimmedThisSwing, s.skimLowZ, s.skimGroundZ = false, nil, nil
   s.time = 0.0
   s.attachCount = s.attachCount + 1
   WebSlinger.SetState(States.SLINGING)
@@ -2479,7 +2549,16 @@ registerForEvent("onDraw", function()
   if WebSlinger.IsGrappling and s.vel ~= nil then
     ImGui.Text(string.format("Rope: %.1f m   Speed: %.1f m/s   Time: %.2f s",
       s.ropeLength, swingSpeed(s.vel), s.time))
+    if s.skimLowZ ~= nil then
+      if s.skimGroundZ ~= nil then
+        ImGui.Text(string.format("Arc low point: z %.1f   Ground: z %.1f   Clearance: %.1f m",
+          s.skimLowZ, s.skimGroundZ, s.skimLowZ - s.skimGroundZ))
+      else
+        ImGui.Text(string.format("Arc low point: z %.1f   Ground: none in reach", s.skimLowZ))
+      end
+    end
   end
+  ImGui.Text(string.format("Skims (rope shortened): %d   Ground slides: %d", s.skimCount, s.groundSlideCount))
   ImGui.Text("Last shot: " .. tostring(s.lastSearch))
   ImGui.Text("Last release: " .. tostring(s.lastRelease or "(none yet)"))
   ImGui.Text("Last wall impact: " .. tostring(WebSlinger.wall.lastImpact))
@@ -2503,6 +2582,9 @@ registerForEvent("onDraw", function()
   cfg.reelSpeed = ImGui.SliderFloat("Reel speed", cfg.reelSpeed, 0.0, 15.0)
   cfg.BottomPumpAccel = ImGui.SliderFloat("Bottom pump accel", cfg.BottomPumpAccel, 0.0, 10.0)
   cfg.BottomPumpWindowDeg = ImGui.SliderFloat("Bottom pump window (deg)", cfg.BottomPumpWindowDeg, 0.0, 60.0)
+  cfg.GroundClearance = ImGui.SliderFloat("Ground clearance", cfg.GroundClearance, 0.0, 5.0)
+  cfg.SkimShortenRate = ImGui.SliderFloat("Skim shorten rate", cfg.SkimShortenRate, 1.0, 40.0)
+  cfg.SkimMinSpeed = ImGui.SliderFloat("Skim min speed", cfg.SkimMinSpeed, 0.0, 20.0)
   cfg.damping = ImGui.SliderFloat("Damping (per s)", cfg.damping, 0.0, 0.5)
   cfg.dampingFloorSpeed = ImGui.SliderFloat("Damping floor speed", cfg.dampingFloorSpeed, 0.0, 60.0)
   cfg.gravity = ImGui.SliderFloat("Swing gravity", cfg.gravity, 5.0, 30.0)

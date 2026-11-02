@@ -197,8 +197,17 @@ while grappling (`deltaTime` clamped to 50 ms):
    plus a taut rope gives an arc, never a straight pull to the point. When the rope was already
    taut, the speed V had with only the outward radial part removed at the start of the step is
    restored after the projection (C2WS-T32, below).
-7. Collision via `ExecuteSmartRaycast` along the step: a walkable surface (normal z > 0.6) lands V;
-   a wall slides her along it.
+6b. Ground skim (C2WS-T33), run just before step 6, after `keepSpeed` is recorded, never while propelling: the
+   arc's lowest feet height is `lowZ = anchor.z - ropeLength - handHeight` (straight below the
+   anchor). A downward `ExecuteSmartRaycast` from V's chest finds the ground under her; if
+   `lowZ < groundZ + GroundClearance` (1.0 m, slider) the rope shortens toward
+   `anchor.z - handHeight - groundZ - GroundClearance` at up to `SkimShortenRate` (12 m/s, slider),
+   never below `minRopeLength` and never longer. The projection then pulls V in and the `keepSpeed`
+   restore keeps her speed, so the shortening costs no tangential speed (as in Spider-Man 2).
+7. Collision via `ExecuteSmartRaycast` along the step: a wall slides her along it. A walkable
+   surface (normal z > 0.6) while falling also slides her (feet set on it, velocity into it removed)
+   if at least `SkimMinSpeed` (6 m/s, slider) is left along it (C2WS-T33); slower than that she lands
+   and the swing ends with no carry. The post-release carry still always lands.
 
 #### Pendulum energy: keeping speed through the bottom (C2WS-T32)
 
@@ -229,7 +238,7 @@ clamp keep a long chain from running away.
 ### Release and momentum
 
 The swing ends (back to `NONE`) on a jump tap, on reaching within `anchorReachDistance` (2.5 m)
-of the anchor, on landing, or after `maxSwingTime` (8 s). Leaving `SLINGING` any way, including a
+of the anchor, on landing (a slow ground touch; a fast one skims, above), or after `maxSwingTime` (8 s). Leaving `SLINGING` any way, including a
 direct `SetState`, runs the `SLINGING` `onExit` hook, which clears the rope and `IsGrappling`.
 Except on landing, V's velocity at release is kept and integrated under gravity (momentum carry)
 until she lands, re-attaches, or `carryMaxTime` (4 s) passes, after which native physics takes
