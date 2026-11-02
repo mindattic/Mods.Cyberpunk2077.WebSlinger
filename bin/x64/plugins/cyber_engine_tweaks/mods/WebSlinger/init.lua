@@ -802,6 +802,13 @@ WebSlinger.polish = {
   FovPunchRise = 0.05,     -- seconds to reach the peak
   FovPunchFall = 0.25,     -- seconds to ease back to the base FOV
   JumpScale = 0.7,         -- wall-jump launch strength relative to a wall-latch impact
+  -- Speed FOV (C2WS-T36): while SLINGING or carrying swing momentum the FOV widens with swing speed
+  -- (|swing.vel|), base + clamp((speed - Start) / (Full - Start), 0, 1) * MaxDeg, eased by Smoothing.
+  SpeedFov = true,         -- off = no speed FOV (the punch still plays)
+  SpeedFovStart = 12.0,    -- m/s where the FOV starts to widen
+  SpeedFovFull = 35.0,     -- m/s where it reaches SpeedFovMaxDeg
+  SpeedFovMaxDeg = 12.0,   -- FOV added at full speed
+  SpeedFovSmoothing = 0.35, -- seconds, time constant of the ease toward the target (never snaps)
 }
 
 -- Live polish state. Written only by setCameraTilt, PlayImpactFeedback and updatePolish.
@@ -814,9 +821,14 @@ WebSlinger.fx = {
   applied = 0.0,        -- last roll written to the camera (tilt + shake)
   shakeTime = nil,      -- seconds since the shake started, nil when none
   shakeAmp = 0.0,
-  fovBase = nil,        -- FOV before the punch, restored when it ends; nil when no punch is live
+  -- One saved base FOV shared by the punch and the speed FOV (C2WS-T36): captured once when the
+  -- first of them starts, written back exactly when both are done. nil when neither is live.
+  fovBase = nil,
   fovTime = 0.0,
-  fovPunch = 0.0,
+  fovPunch = 0.0,       -- peak degrees of the live punch, 0 when none
+  speedFov = 0.0,       -- current eased speed-FOV offset (degrees)
+  speedFovTarget = 0.0, -- what speedFov is easing toward, for the debug panel
+  fovApplied = nil,     -- last FOV written, so an unchanged value is not rewritten
   costMs = 0.0,         -- smoothed per-tick cost of updatePolish, for the frame-time check
   lastImpulse = "(none yet)",
   impulseCount = 0,
@@ -842,11 +854,43 @@ local function setFov(value)
   return pcall(function() cam:SetFOV(value) end)
 end
 
--- Ends any FOV punch at once, putting the base FOV back.
+-- Ends every FOV effect (punch and speed FOV) at once, putting the player's base FOV back exactly.
 local function endFovPunch()
   local fx = WebSlinger.fx
   if fx.fovBase ~= nil then setFov(fx.fovBase) end
-  fx.fovBase, fx.fovPunch = nil, 0.0
+  fx.fovBase, fx.fovPunch, fx.fovApplied = nil, 0.0, nil
+  fx.speedFov, fx.speedFovTarget = 0.0, 0.0
+end
+
+-- Saves the player's FOV as the shared base if no effect holds it yet. Only ever called while
+-- fovBase is nil, i.e. while the camera is at the player's own FOV. Returns true if a base is held.
+local function captureFovBase()
+  local fx = WebSlinger.fx
+  if fx.fovBase ~= nil then return true end
+  local cam = fppCamera()
+  local ok, base = false, nil
+  if cam ~= nil then ok, base = pcall(function() return cam:GetFOV() end) end
+  if ok and type(base) == "number" then
+    fx.fovBase, fx.fovApplied = base, base
+    return true
+  end
+  return false
+end
+
+-- Speed-FOV target (degrees over base) for this tick: 0 unless the mod is on and V is swinging or
+-- carrying swing momentum, so landing, CLIMBING, WALLRUNNING and disabling all ease it back.
+local function speedFovTarget()
+  local p, s = WebSlinger.polish, WebSlinger.swing
+  if not p.SpeedFov or not WebSlinger.enabled or p.SpeedFovMaxDeg <= 0.0 then return 0.0 end
+  if WebSlinger.state ~= States.SLINGING and not s.carry then return 0.0 end
+  local v = s.vel
+  if v == nil then return 0.0 end
+  local speed = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+  local span = math.max(p.SpeedFovFull - p.SpeedFovStart, 1e-3)
+  local k = (speed - p.SpeedFovStart) / span
+  if k <= 0.0 then return 0.0 end
+  if k > 1.0 then k = 1.0 end
+  return k * p.SpeedFovMaxDeg
 end
 
 --- Sets the camera roll target. With polish on, the roll eases there over blendTime (the per-tick
@@ -870,13 +914,9 @@ function WebSlinger.PlayImpactFeedback(strength, label)
   if not p.Enabled then return end
   fx.shakeTime, fx.shakeAmp = 0.0, p.ShakeAmplitudeDeg * strength
   if p.FovPunchDeg * strength > 0.0 then
-    if fx.fovBase == nil then
-      local cam = fppCamera()
-      local ok, base = false, nil
-      if cam ~= nil then ok, base = pcall(function() return cam:GetFOV() end) end
-      if ok and type(base) == "number" then fx.fovBase = base end
-    end
-    if fx.fovBase ~= nil then
+    -- Shares the base with the speed FOV: never re-read GetFOV mid-effect (that would save a
+    -- widened FOV as the base and leave it behind).
+    if captureFovBase() then
       fx.fovTime, fx.fovPunch = 0.0, p.FovPunchDeg * strength
     end
   end
@@ -900,7 +940,8 @@ local function updatePolish(dt)
     return
   end
   local tiltBusy = fx.tilt ~= fx.tiltTo or fx.applied ~= fx.tiltTo
-  if not tiltBusy and fx.shakeTime == nil and fx.fovBase == nil then return end
+  if not tiltBusy and fx.shakeTime == nil and fx.fovBase == nil
+    and (WebSlinger.state ~= States.SLINGING and not WebSlinger.swing.carry) then return end
   local started = os.clock()
 
   -- Eased tilt.
@@ -931,19 +972,47 @@ local function updatePolish(dt)
     fx.applied = roll
   end
 
-  -- FOV punch: linear rise, smoothstep fall.
-  if fx.fovBase ~= nil then
+  -- Speed FOV (C2WS-T36): exponential ease of the offset toward the speed target. The base is
+  -- captured only when the offset first needs to rise; it is never re-read while held.
+  local target = speedFovTarget()
+  fx.speedFovTarget = target
+  if target > 0.0 and fx.fovBase == nil then captureFovBase() end
+  if fx.fovBase == nil then
+    fx.speedFov = 0.0
+  elseif fx.speedFov ~= target then
+    local tau = math.max(p.SpeedFovSmoothing, 1e-3)
+    fx.speedFov = fx.speedFov + (target - fx.speedFov) * (1.0 - math.exp(-dt / tau))
+    if math.abs(fx.speedFov - target) < 0.01 then fx.speedFov = target end
+  end
+
+  -- FOV punch: linear rise, smoothstep fall, added on top of the speed FOV (so it settles back to
+  -- the speed FOV, not to the base).
+  local punch = 0.0
+  if fx.fovPunch > 0.0 then
     fx.fovTime = fx.fovTime + dt
     local k
     if fx.fovTime < p.FovPunchRise then
-      k = fx.fovTime / p.FovPunchRise
+      k = fx.fovTime / math.max(p.FovPunchRise, 1e-3)
     else
       k = 1.0 - easeInOut((fx.fovTime - p.FovPunchRise) / math.max(p.FovPunchFall, 1e-3))
     end
-    if k <= 0.0 then
+    if k <= 0.0 then fx.fovPunch = 0.0 else punch = fx.fovPunch * k end
+  end
+
+  -- One writer for the FOV: base + speed + punch. Both done -> the exact saved base goes back.
+  if fx.fovBase ~= nil then
+    if fx.fovPunch <= 0.0 and fx.speedFov <= 0.0 then
       endFovPunch()
-    elseif not setFov(fx.fovBase + fx.fovPunch * k) then
-      fx.fovBase, fx.fovPunch = nil, 0.0
+    else
+      local fov = fx.fovBase + fx.speedFov + punch
+      if fx.fovApplied == nil or math.abs(fov - fx.fovApplied) > 1e-3 then
+        if setFov(fov) then
+          fx.fovApplied = fov
+        else
+          -- Camera gone (load, menu): nothing to restore onto; drop the effects.
+          fx.fovBase, fx.fovPunch, fx.fovApplied, fx.speedFov = nil, 0.0, nil, 0.0
+        end
+      end
     end
   end
 
@@ -2328,7 +2397,7 @@ registerForEvent("onDraw", function()
   -- Polish (C2WS-T13). Compare "Frame" above with this on and off: the polish cost must not move it.
   ImGui.Separator()
   local pp, fx = WebSlinger.polish, WebSlinger.fx
-  pp.Enabled = ImGui.Checkbox("Polish: eased tilt + impact shake/FOV punch", pp.Enabled)
+  pp.Enabled = ImGui.Checkbox("Polish: eased tilt + impact shake/FOV punch + speed FOV", pp.Enabled)
   ImGui.Text(string.format("Polish cost: %.3f ms/tick (while animating)   Roll: %.1f deg", fx.costMs, fx.applied))
   ImGui.Text("Last impact feedback: " .. tostring(fx.lastImpulse))
   wr.CameraTiltTime = ImGui.SliderFloat("Wall-run tilt ease time", wr.CameraTiltTime, 0.0, 1.0)
@@ -2336,6 +2405,14 @@ registerForEvent("onDraw", function()
   pp.ShakeDuration = ImGui.SliderFloat("Impact shake time", pp.ShakeDuration, 0.0, 1.0)
   pp.FovPunchDeg = ImGui.SliderFloat("Impact FOV punch (deg)", pp.FovPunchDeg, 0.0, 15.0)
   pp.JumpScale = ImGui.SliderFloat("Wall-jump feedback scale", pp.JumpScale, 0.0, 1.5)
+  -- Speed FOV (C2WS-T36).
+  pp.SpeedFov = ImGui.Checkbox("Speed FOV while swinging", pp.SpeedFov)
+  ImGui.Text(string.format("Speed FOV: +%.1f deg (target +%.1f)   Base FOV: %s", fx.speedFov,
+    fx.speedFovTarget, fx.fovBase ~= nil and string.format("%.1f", fx.fovBase) or "(player's, untouched)"))
+  pp.SpeedFovStart = ImGui.SliderFloat("Speed FOV start (m/s)", pp.SpeedFovStart, 0.0, 40.0)
+  pp.SpeedFovFull = ImGui.SliderFloat("Speed FOV full (m/s)", pp.SpeedFovFull, 1.0, 60.0)
+  pp.SpeedFovMaxDeg = ImGui.SliderFloat("Speed FOV max (deg)", pp.SpeedFovMaxDeg, 0.0, 25.0)
+  pp.SpeedFovSmoothing = ImGui.SliderFloat("Speed FOV smoothing (s)", pp.SpeedFovSmoothing, 0.05, 1.5)
 
   -- Monowire hand anchor (C2WS-T26): cosmetic only, never touches V's equipment.
   ImGui.Separator()
