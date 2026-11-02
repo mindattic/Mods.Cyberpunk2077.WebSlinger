@@ -29,7 +29,7 @@ local TRANSITION_LOG_SIZE = 16
 
 local WebSlinger = {
   -- C2WS-T16: release version; tools/package.ps1 names dist/WebSlinger-<version>.zip from it.
-  version = "0.1.0",
+  version = "1.0.0",
   enabled = false,
   States = States,
   state = States.NONE,
