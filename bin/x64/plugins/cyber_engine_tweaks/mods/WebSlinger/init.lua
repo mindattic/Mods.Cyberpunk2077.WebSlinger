@@ -170,6 +170,7 @@ WebSlinger.wallrun = {
   minWallNormal2D = 0.5,        -- hit normals flatter than this (floors, ledges) are not walls
   ManualTriggerDistance = 1.5,  -- jump-key side probes reach this far left/right of V
   ManualMaxFacingDot = 0.8,     -- |aim heading . wallNormal| above this = wall ahead, not to the side
+  ManualLatchDistance = 1.5,    -- jump-key head-on probe reach straight ahead of V (C2WS-T21)
   UseLocomotionVelocity = true, -- false = drive V by teleport each tick instead of SetLinearVelocity
 }
 
@@ -1062,13 +1063,16 @@ function WebSlinger.TryManualWallRun()
     Vector4.new(-rx + hx, -ry + hy, 0.0, 0.0),
   }
 
+  -- A wall the swing-impact check would call head-on (above WallLatchAngleThreshold) is left to
+  -- TryManualWallLatch, so the side/head-on split matches CheckWallCollisionDuringSwing (C2WS-T21).
+  local maxFacing = math.min(cfg.ManualMaxFacingDot, WebSlinger.impact.WallLatchAngleThreshold)
   local bestNormal, bestPos, bestDist = nil, nil, math.huge
   for _, dir in ipairs(probes) do
     local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(origin, dir, cfg.ManualTriggerDistance)
     if hit then
       local n = flatUnit(hitNormal)
       local n2 = math.sqrt(hitNormal.x * hitNormal.x + hitNormal.y * hitNormal.y)
-      if n ~= nil and n2 >= cfg.minWallNormal2D and math.abs(n.x * hx + n.y * hy) <= cfg.ManualMaxFacingDot then
+      if n ~= nil and n2 >= cfg.minWallNormal2D and math.abs(n.x * hx + n.y * hy) <= maxFacing then
         local dx, dy = hitPos.x - origin.x, hitPos.y - origin.y
         local dist = dx * dx + dy * dy
         if dist < bestDist then bestNormal, bestPos, bestDist = n, hitPos, dist end
@@ -1082,6 +1086,40 @@ function WebSlinger.TryManualWallRun()
   s.carry = false
   print("[WebSlinger] wall-run: manual trigger (jump)")
   return WebSlinger.InitiateWallRun(bestNormal, velocity, bestPos, true)
+end
+
+--- Manual head-on entry into CLIMBING (C2WS-T21): called when jump is pressed in NONE after
+-- TryManualWallRun found no side wall. Probes straight ahead along V's look/move heading out to
+-- ManualLatchDistance; a wall facing her head-on (|heading . normal| above the swing-impact
+-- check's WallLatchAngleThreshold, the complement of TryManualWallRun's side filter) latches her
+-- onto it immediately. No swing, no minimum approach speed (standing, walking, running or
+-- falling all qualify: the press is the deliberate action), and no equipment check.
+-- Returns true if V latched.
+function WebSlinger.TryManualWallLatch()
+  if WebSlinger.state ~= States.NONE then return false end
+  local player = Game.GetPlayer()
+  if player == nil then return false end
+  local cfg, s = WebSlinger.wallrun, WebSlinger.swing
+
+  local pos = player:GetWorldPosition()
+  local origin = vec4(pos.x, pos.y, pos.z + cfg.probeHeight)
+  local hx, hy = aimHeading(player, true)
+  local hit, hitPos, hitNormal = WebSlinger.ExecuteSmartRaycast(
+    origin, Vector4.new(hx, hy, 0.0, 0.0), cfg.ManualLatchDistance)
+  if not hit then return false end
+
+  local n = flatUnit(hitNormal)
+  local n2 = math.sqrt(hitNormal.x * hitNormal.x + hitNormal.y * hitNormal.y)
+  if n == nil or n2 < cfg.minWallNormal2D then return false end  -- floor/ledge, not a wall
+  local facing = math.abs(n.x * hx + n.y * hy)
+  if facing <= WebSlinger.impact.WallLatchAngleThreshold then return false end
+
+  local seed = s.carry and s.vel or s.estVel
+  local velocity = { x = seed.x, y = seed.y, z = seed.z }
+  s.carry = false
+  print(string.format("[WebSlinger] wall-latch: manual trigger (jump, facing %.2f)", facing))
+  WebSlinger.TriggerWallLatch(n, hitPos, velocity)
+  return true
 end
 
 -- Camera tilt plays on entry (rolled away from the wall) and blends back to neutral on exit.
@@ -1123,7 +1161,8 @@ local function observeWallRunJump()
 end
 
 -- One wall-run tick: consumes a queued jump press (manual trigger from NONE, wall-jump while
--- running) and runs the wall-run physics. onUpdate only.
+-- running) and runs the wall-run physics. onUpdate only. From NONE the side wall-run probe runs
+-- first and the head-on latch probe only if it found nothing, so one press triggers at most one.
 local function updateWallRun(dt)
   local r = WebSlinger.run
   local jump = r.jumpQueued
@@ -1132,7 +1171,9 @@ local function updateWallRun(dt)
     if jump and WebSlinger.WallJump() then return end
     WebSlinger.UpdateWallHangPhysics(dt)
   elseif jump and WebSlinger.state == States.NONE then
-    WebSlinger.TryManualWallRun()
+    if not WebSlinger.TryManualWallRun() then
+      WebSlinger.TryManualWallLatch()
+    end
   end
 end
 
@@ -1924,6 +1965,7 @@ registerForEvent("onDraw", function()
   wr.WallRunMaxDuration = ImGui.SliderFloat("Wall-run max duration", wr.WallRunMaxDuration, 0.5, 10.0)
   wr.BrakeDecel = ImGui.SliderFloat("Wall-run brake decel", wr.BrakeDecel, 0.0, 40.0)
   wr.ManualTriggerDistance = ImGui.SliderFloat("Wall-run jump reach", wr.ManualTriggerDistance, 0.5, 4.0)
+  wr.ManualLatchDistance = ImGui.SliderFloat("Wall-latch jump reach", wr.ManualLatchDistance, 0.5, 2.0)
 
   ImGui.Separator()
   local wj, wjc = WebSlinger.wj, WebSlinger.walljump

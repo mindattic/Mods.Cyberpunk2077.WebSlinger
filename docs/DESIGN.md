@@ -170,6 +170,26 @@ so after a wall-run impact use the debug panel's `NONE` button to return.
 cyberware slot. The climb is a permanent ability the mod grants; "Mantis Blade climb" survives only
 as flavour in comments and docs.
 
+### Manual head-on entry: jump into a wall (C2WS-T21)
+
+Besides a head-on swing impact (C2WS-T7) and a wall-jump's in-flight catch (C2WS-T11), V can start
+climbing from a plain jump: pressing the game's own Jump action while in `NONE` (standing, walking,
+running, falling, or in post-swing carry) runs `TryManualWallLatch()` when the side wall-run probe
+found nothing. It casts one `ExecuteSmartRaycast` from chest height straight along V's look/move
+heading, out to `wallrun.ManualLatchDistance` (1.5 m; kept under the `CLIMBING` enter re-probe's
+reach), and on a wall-like hit (`flat normal >= minWallNormal2D`) whose normal faces her head-on
+(`abs(heading . normal) > impact.WallLatchAngleThreshold`, 0.75) calls
+`TriggerWallLatch(normal, hitPos, velocity)` directly. There is no minimum approach speed (unlike the
+swing-impact path, this is a deliberate press, not an incidental physics event) and no equipment check.
+
+**Order of checks on a jump press in `NONE`** (`updateWallRun`): `TryManualWallRun()` (side walls)
+first, then `TryManualWallLatch()` (head-on) only if no run started, so one press triggers at most
+one of them. Both use the swing-impact check's latch-vs-run convention for an ambiguous wall: the
+side probe accepts only `abs(heading . normal) <= min(ManualMaxFacingDot, WallLatchAngleThreshold)`,
+and the head-on probe only `> WallLatchAngleThreshold`, so a wall near the boundary lands where a
+swing into it would. Not yet verified in-game: from a standing or running start with no cyberware
+equipped and no swing active, face a wall head-on, press jump, and confirm V enters `CLIMBING`.
+
 ### Entering `CLIMBING`: gravity, fall damage, residual velocity
 
 The `CLIMBING` `onEnter` hook re-probes into the wall along `-wall.normal` (or, if entered from the
@@ -274,8 +294,9 @@ Two entry points into `WALLRUNNING`, neither gated by any equipment or cyberware
    or in post-swing carry) runs `TryManualWallRun()`. It casts `ExecuteSmartRaycast` from chest
    height to V's left and right and along both forward diagonals (relative to her look/move
    heading), out to `ManualTriggerDistance` (1.5 m), and takes the nearest wall whose normal is not
-   facing her head-on (`abs(heading . normal) <= ManualMaxFacingDot`, 0.8), so a wall straight
-   ahead stays the climb's business. Jump is read through `Observe("PlayerPuppet", "OnAction")`, so
+   facing her head-on (`abs(heading . normal) <= ManualMaxFacingDot`, 0.8, further capped at
+   `impact.WallLatchAngleThreshold`, 0.75), so a wall straight ahead stays the climb's business
+   (`TryManualWallLatch()`, C2WS-T21, runs next on the same press if no run started). Jump is read through `Observe("PlayerPuppet", "OnAction")`, so
    it is whatever the player has bound to jump.
 
 `InitiateWallRun` follows the ticket's reference: `wallParallelDir` is the perpendicular of the
