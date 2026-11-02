@@ -113,6 +113,7 @@ local WebSlinger = {
     lastPos = nil,        -- V's position last tick, for the velocity estimate below
     estVel = { x = 0.0, y = 0.0, z = 0.0 },  -- smoothed velocity of V from position deltas
     lastSearch = "(none yet)",  -- one-line result of the last aimed shot, for the panel
+    lastShotPath = "none",      -- "aimed", "assist" or "miss": which FindAnchor path the last tap took (C2WS-T34)
     attachCount = 0,
     tapReleaseCount = 0,  -- swings let go with a jump tap (C2WS-T30), for the panel
   },
@@ -120,7 +121,6 @@ local WebSlinger = {
   -- Visible swing cable (C2WS-T25) tunables. In first person V's real hand point (her body centre)
   -- sits under the camera, so the cable is drawn from a point just ahead of the camera, offset to
   -- the lower right where V's right hand shows on screen. Distances in metres along the camera axes.
-    lastShotPath = "none",      -- "aimed", "assist" or "miss": which FindAnchor path the last tap took (C2WS-T34)
   rope = {
     thickness = 4.0,            -- core cable width in pixels (the old debug line was 2.0)
     color = { 0.10, 0.85, 1.00, 0.95 },  -- electric cyan; never the debug overlay's green/red/yellow
