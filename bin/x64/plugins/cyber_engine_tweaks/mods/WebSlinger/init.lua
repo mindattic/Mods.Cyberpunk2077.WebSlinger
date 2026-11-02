@@ -87,7 +87,9 @@ local WebSlinger = {
   swing = {
     keyHeld = false,      -- current state of the CET-bound swing input, polled each tick
     keyWasHeld = false,   -- keyHeld as of the previous tick, for edge detection
-    anchor = nil,         -- Vector4 world anchor point while attached
+    auto = false,         -- current swing was auto-fired by a mid-air jump, not the held bind (C2WS-T22)
+    autoCount = 0,        -- swings auto-fired by a mid-air jump, for the panel
+    anchor = nil,        -- Vector4 world anchor point while attached
     anchorNormal = nil,   -- surface normal at the anchor
     ropeLength = 0.0,
     pos = nil,            -- simulated feet position (Vector4) while attached or carrying
@@ -559,9 +561,10 @@ function WebSlinger.UpdateGrapplePhysics(deltaTime)
     releaseSling("reached anchor", true)
   elseif s.time >= cfg.maxSwingTime then
     releaseSling("swing time cap", true)
-  elseif s.keyHeld and s.time >= cfg.chainMinSwingTime and v.z > 0.0 then
+  elseif (s.keyHeld or s.auto) and s.time >= cfg.chainMinSwingTime and v.z > 0.0 then
     -- Chain point: V has swung past the bottom of the arc (in her direction of travel) by at least
     -- chainReleaseAngleDeg and is rising. Letting go here launches her forward into the next swing.
+    -- A jump-fired swing (C2WS-T22) has no held key to let go of, so it always ends here too.
     local hx, hy, hz = s.pos.x - a.x, s.pos.y - a.y, (s.pos.z + hand) - a.z
     local hlen = math.sqrt(hx * hx + hy * hy + hz * hz)
     local ahead = hx * v.x + hy * v.y > 0.0
@@ -1151,7 +1154,9 @@ end
 local function observeWallRunJump()
   Observe("PlayerPuppet", "OnAction", function(_, action)
     -- NONE: manual wall-run trigger. WALLRUNNING: wall-jump off the run (C2WS-T11).
-    if WebSlinger.state ~= States.NONE and WebSlinger.state ~= States.WALLRUNNING then return end
+    -- SLINGING: lets go of a jump-fired swing (C2WS-T22).
+    if WebSlinger.state ~= States.NONE and WebSlinger.state ~= States.WALLRUNNING
+      and WebSlinger.state ~= States.SLINGING then return end
     local ok, isJump = pcall(function()
       return Game.NameToString(ListenerAction.GetName(action)) == "Jump"
         and ListenerAction.GetType(action).value == "BUTTON_PRESSED"
@@ -1160,9 +1165,32 @@ local function observeWallRunJump()
   end)
 end
 
+--- Mid-air double-jump web-sling (C2WS-T22): called when jump is pressed in NONE and neither
+-- manual wall probe found a wall. If V is airborne, runs the same anchor search and attach as the
+-- held swing bind (tryAttach -> FindAnchor along her look heading) and enters SLINGING with no bind
+-- held. Grounded presses are left alone (the plain game jump). No anchor is a soft fail: nothing
+-- changes and the press stays the game's own jump. Returns true if a swing started.
+function WebSlinger.TryJumpSling()
+  if WebSlinger.state ~= States.NONE then return false end
+  local player = Game.GetPlayer()
+  if player == nil then return false end
+  if isGrounded(player:GetWorldPosition()) then return false end
+  local s = WebSlinger.swing
+  if not tryAttach(player) then
+    print("[WebSlinger] jump-sling: " .. tostring(s.lastSearch))
+    return false
+  end
+  -- A held bind already owns the swing (hold to swing, release to let go); otherwise it is ours.
+  s.auto = not s.keyHeld
+  s.autoCount = s.autoCount + 1
+  print("[WebSlinger] jump-sling: attached (" .. tostring(s.lastSearch) .. ")")
+  return true
+end
+
 -- One wall-run tick: consumes a queued jump press (manual trigger from NONE, wall-jump while
 -- running) and runs the wall-run physics. onUpdate only. From NONE the side wall-run probe runs
--- first and the head-on latch probe only if it found nothing, so one press triggers at most one.
+-- first, the head-on latch probe only if it found nothing, and, if V is airborne, the jump-fired
+-- web-sling only if neither found a wall, so one press triggers at most one.
 local function updateWallRun(dt)
   local r = WebSlinger.run
   local jump = r.jumpQueued
@@ -1170,9 +1198,13 @@ local function updateWallRun(dt)
   if WebSlinger.state == States.WALLRUNNING then
     if jump and WebSlinger.WallJump() then return end
     WebSlinger.UpdateWallHangPhysics(dt)
+  elseif jump and WebSlinger.state == States.SLINGING then
+    -- A jump during a jump-fired swing lets go with momentum carry (C2WS-T22). A swing held on the
+    -- dedicated bind ignores jump, as before.
+    if WebSlinger.swing.auto then releaseSling("jump released auto-sling", true) end
   elseif jump and WebSlinger.state == States.NONE then
-    if not WebSlinger.TryManualWallRun() then
-      WebSlinger.TryManualWallLatch()
+    if not WebSlinger.TryManualWallRun() and not WebSlinger.TryManualWallLatch() then
+      WebSlinger.TryJumpSling()
     end
   end
 end
@@ -1239,10 +1271,13 @@ local function updateSling(dt)
 
   local state = WebSlinger.state
   if state == States.SLINGING then
+    -- Pressing the swing bind during a jump-fired swing hands it over to the bind (C2WS-T22):
+    -- from then on it is an ordinary held swing that ends when the bind is released.
+    if s.auto and held then s.auto = false end
     if s.anchor == nil then
       -- Entered SLINGING without a rope (e.g. the debug Force state button): nothing to swing on.
       releaseSling("no anchor", false)
-    elseif not held then
+    elseif not held and not s.auto then
       releaseSling("key released", true)
     elseif not WebSlinger.CheckWallCollisionDuringSwing() then
       -- Impact check runs before the physics step, which would otherwise slide V along the wall.
@@ -1296,6 +1331,7 @@ StateHooks[States.SLINGING].onExit = function()
     s.lastRelease = "left SLINGING via SetState"
   end
   WebSlinger.IsGrappling = false
+  s.auto = false
   s.carry = carry and s.anchor ~= nil and s.pos ~= nil and s.vel ~= nil
   s.carryTime = 0.0
   s.releaseCarry = nil
@@ -1922,6 +1958,8 @@ registerForEvent("onDraw", function()
   ImGui.Text("Web-sling: bind the key under CET Bindings > WebSlinger")
   ImGui.Text(string.format("Key: %s   Grappling: %s   Carry: %s   Attaches: %d",
     s.keyHeld and "HELD" or "up", tostring(WebSlinger.IsGrappling), tostring(s.carry), s.attachCount))
+  ImGui.Text(string.format("Jump-sling: %s   Jump-fired swings: %d",
+    s.auto and "ACTIVE" or "off", s.autoCount))
   if WebSlinger.IsGrappling and s.vel ~= nil then
     ImGui.Text(string.format("Rope: %.1f m   Speed: %.1f m/s   Time: %.2f s",
       s.ropeLength, swingSpeed(s.vel), s.time))

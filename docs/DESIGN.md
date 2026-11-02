@@ -123,6 +123,35 @@ past the bottom of the arc in the direction of travel by `chainReleaseAngleDeg`,
 the new swing with the carried velocity. Holding the key through a run of buildings chains swing
 after swing with no re-aiming.
 
+### Jump-jump: mid-air jump auto-fires a swing (C2WS-T22)
+
+A second jump press while V is airborne and in `NONE` fires a web-sling toward where she is
+looking, with no swing bind held. The press goes through the same queued jump
+(`Observe("PlayerPuppet", "OnAction")` -> `run.jumpQueued`) the manual wall triggers use, and
+`updateWallRun` tries the consumers in order so one press triggers at most one: (1)
+`TryManualWallRun()` (side wall), (2) `TryManualWallLatch()` (wall straight ahead, C2WS-T21), (3)
+`TryJumpSling()`. The last returns early if `isGrounded` says V is on the ground, so a jump from
+the ground is untouched (plain game jump, plus the side-wall trigger that was already there).
+Airborne, it calls `tryAttach(player)`, the same `FindAnchor` search (centred on the look heading)
+and attach the held bind uses, and enters `SLINGING` directly. If no anchor qualifies nothing
+changes: the press stays the game's own jump and the miss is logged and shown as "Last search".
+
+From there the swing is an ordinary swing: same physics, wall-impact routing (C2WS-T7/T9), landing,
+anchor-reach and time-cap releases, and momentum carry on release. Only letting go differs,
+because there is no held key to release. **Decision:** a jump-fired swing lets go (with momentum
+carry) on the next jump press, or by itself at the chain point, exactly where a held swing chains.
+That keeps the hold-to-swing convention intact (it never ends because a bind that was never pressed
+reads as "released") and makes the loop "jump, jump to swing, jump again to let go or wait for the
+fling, jump again for the next swing". A plain timeout was rejected: the swing's own end conditions
+(chain point, reaching the anchor, `maxSwingTime`) already bound it. Pressing the swing bind during
+a jump-fired swing hands it to the bind: from then on it is a held swing that ends on bind release,
+and jump no longer lets go. A swing started on the bind ignores jump, as before. The panel shows
+whether the current swing is jump-fired and how many have fired.
+
+Not yet verified in-game; outstanding check from the ticket: from a standstill with no cyberware
+equipped, look toward a tall building, jump, jump again before landing, and confirm V attaches and
+swings in the looked-at direction with no swing bind held.
+
 ### Verification status
 
 Not yet verified in-game; the agent that implemented this could not run the game. Outstanding
