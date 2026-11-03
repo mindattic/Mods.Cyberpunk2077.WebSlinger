@@ -2525,6 +2525,11 @@ end
 -- the README's first-run steps describe), not over gameplay. The cable, the Peter Parker text and
 -- the opt-in raycast debug lines are in-world visuals and still draw with the overlay closed.
 WebSlinger.overlayOpen = false
+-- C2WS-T47: seed from the live state, since a "Reload all mods" with the overlay open never fires onOverlayOpen.
+do
+  local okVis, vis = pcall(function() return CET and CET.IsOverlayVisible and CET.IsOverlayVisible() end)
+  if okVis and vis then WebSlinger.overlayOpen = true end
+end
 registerForEvent("onOverlayOpen", function() WebSlinger.overlayOpen = true end)
 registerForEvent("onOverlayClose", function() WebSlinger.overlayOpen = false end)
 
