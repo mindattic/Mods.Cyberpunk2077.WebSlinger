@@ -645,6 +645,13 @@ local function moveWithCollision(s, nx, ny, nz, skimMinSpeed)
       if into < 0.0 then
         v.x, v.y, v.z = v.x - into * hitNormal.x, v.y - into * hitNormal.y, v.z - into * hitNormal.z
       end
+      if hitNormal.z < -0.3 then
+        -- Ceiling / overhang underside: the target is above the surface the chest ray hit, and
+        -- keeping nz would carry V straight through it. Hold the chest 0.45 below that plane.
+        local d = (nx - hitPos.x) * hitNormal.x + (ny - hitPos.y) * hitNormal.y
+          + (nz + 0.9 - hitPos.z) * hitNormal.z
+        if d < 0.45 then nz = nz + hitNormal.z * (0.45 - d) end
+      end
       nx, ny = hitPos.x + hitNormal.x * 0.45, hitPos.y + hitNormal.y * 0.45
     end
   end
@@ -2258,7 +2265,7 @@ end
 local function monowireHandPoint()
   local s, m = WebSlinger.swing, WebSlinger.monowire
   local shoulder = vec4(s.pos.x, s.pos.y, s.pos.z + WebSlinger.sling.handHeight)
-  if not m.HandAnchor then return shoulder end
+  if not m.HandAnchor then return shoulder, false end
 
   local toAnchor = normalized(Vector4.new(s.anchor.x - shoulder.x, s.anchor.y - shoulder.y,
     s.anchor.z - shoulder.z, 0.0))
@@ -2269,7 +2276,7 @@ local function monowireHandPoint()
   end
 
   local player = Game.GetPlayer()
-  if player == nil then return estimate end
+  if player == nil then return estimate, false end
   local p = nil
   if m.resolvedFor ~= s.attachCount then
     m.resolvedFor = s.attachCount
@@ -2281,7 +2288,8 @@ local function monowireHandPoint()
       p = nil
     end
   end
-  return p or estimate
+  -- Second return: true only when the point came from a slot reading this frame.
+  return p or estimate, p ~= nil
 end
 
 -- Projects a world point to screen pixels. Returns nil when the point is behind the camera or
@@ -2384,8 +2392,10 @@ local function drawRope()
   if WebSlinger.monowire.HandAnchor then
     -- V's right-hand slot (C2WS-T26) when one resolved; its body-centre estimate sits under the
     -- first-person camera, so without a slot the camera-relative start above is the better hand.
-    local slotHand = monowireHandPoint()
-    if WebSlinger.monowire.component ~= nil then hand = slotHand end
+    -- Only a real slot reading this frame replaces it: a cached slot whose read fails (or is
+    -- implausible) falls back to that same body-centre estimate, which is not the better hand.
+    local slotHand, fromSlot = monowireHandPoint()
+    if fromSlot then hand = slotHand end
   end
 
   -- Near-plane clip: depth along the camera forward, keep only the part in front of nearClip.
@@ -2517,11 +2527,29 @@ registerForEvent("onInit", function()
   observeWallRunJump()
 end)
 
+-- Mod reload / game exit: undo what this instance holds on the engine side, since a reloaded
+-- instance starts with fresh state and would never remove the climb god-mode flag, and would save a
+-- widened FOV (speed FOV / punch) as the player's base and keep it.
+registerForEvent("onShutdown", function()
+  local player = Game.GetPlayer()
+  if player ~= nil and WebSlinger.climbing.invulnerable then setClimbInvulnerable(player, false) end
+  endFovPunch()
+  if WebSlinger.fx.applied ~= 0.0 then rawCameraTilt(0.0, 0.0) end
+end)
+
 registerForEvent("onUpdate", function(deltaTime)
   WebSlinger.timing.frameMs = smooth(WebSlinger.timing.frameMs, deltaTime * 1000.0)
 
   -- Polish (C2WS-T13) runs even while disabled so an exit tilt eases back and a punch ends cleanly.
   updatePolish(math.min(deltaTime, 0.05))
+
+  -- A CLIMBING exit with no player reference (load screen) could not remove the climb's god-mode
+  -- flag and left climbing.invulnerable set for a retry: retry it here once a player is back, so
+  -- V is not left invulnerable and the next climb's add is not skipped by the already-on guard.
+  if WebSlinger.climbing.invulnerable and WebSlinger.state ~= States.CLIMBING then
+    local player = Game.GetPlayer()
+    if player ~= nil then setClimbInvulnerable(player, false) end
+  end
 
   if WebSlinger.enabled or WebSlinger.debugRaycast then
     updateWallProbe()
@@ -2591,6 +2619,9 @@ registerForEvent("onDraw", function()
   for i, name in ipairs(STATE_ORDER) do
     if i > 1 then ImGui.SameLine() end
     if ImGui.Button(name) then
+      -- A forced CLIMBING has no impact: drop any earlier latch/run's wall normal so the CLIMBING
+      -- enter hook probes the wall V is facing instead of a stale one.
+      if name == States.CLIMBING and WebSlinger.state ~= States.CLIMBING then WebSlinger.wall.normal = nil end
       WebSlinger.SetState(name)
     end
   end
