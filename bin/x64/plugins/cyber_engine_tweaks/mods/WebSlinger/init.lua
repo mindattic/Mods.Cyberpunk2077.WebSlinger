@@ -2521,6 +2521,13 @@ local function drawPeterText()
   ImGui.PopStyleVar(2)
 end
 
+-- C2WS-T46: the WebSlinger settings/readout window shows only while the CET overlay is open (as
+-- the README's first-run steps describe), not over gameplay. The cable, the Peter Parker text and
+-- the opt-in raycast debug lines are in-world visuals and still draw with the overlay closed.
+WebSlinger.overlayOpen = false
+registerForEvent("onOverlayOpen", function() WebSlinger.overlayOpen = true end)
+registerForEvent("onOverlayClose", function() WebSlinger.overlayOpen = false end)
+
 registerForEvent("onInit", function()
   print("[WebSlinger] loaded (wall raycast utility, state machine, web-sling base)")
   observeClimbInput()
@@ -2583,6 +2590,7 @@ registerForEvent("onDraw", function()
   drawRope()
   drawPeterText()
 
+  if not WebSlinger.overlayOpen then return end -- C2WS-T46
   if not ImGui.Begin("WebSlinger") then
     ImGui.End()
     return
